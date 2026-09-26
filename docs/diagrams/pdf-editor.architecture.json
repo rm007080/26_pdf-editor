@@ -1,0 +1,179 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "PDF編集の構成",
+    "quality_profile": "showcase"
+  },
+  "layout": {
+    "mode": "grid",
+    "origin": [48, 56],
+    "cols": 4,
+    "gapX": 72,
+    "gapY": 108,
+    "cellW": 210,
+    "cellH": 76
+  },
+  "components": [
+    {
+      "id": "source",
+      "type": "external",
+      "label": "元 PDF",
+      "sublabel": "ロックしない",
+      "row": 0,
+      "col": 2
+    },
+    {
+      "id": "editor",
+      "type": "external",
+      "label": "編集する人",
+      "sublabel": "この Windows PC",
+      "row": 1,
+      "col": 0
+    },
+    {
+      "id": "webui",
+      "type": "frontend",
+      "label": "Web UI",
+      "sublabel": "React · PDF.js",
+      "row": 1,
+      "col": 1
+    },
+    {
+      "id": "api",
+      "type": "backend",
+      "label": "Python バックエンド",
+      "sublabel": "FastAPI · 編集状態",
+      "tag": "127.0.0.1:8765",
+      "row": 1,
+      "col": 2
+    },
+    {
+      "id": "session",
+      "type": "external",
+      "label": "セッションコピー",
+      "sublabel": "Windows Temp",
+      "row": 1,
+      "col": 3
+    },
+    {
+      "id": "tray",
+      "type": "external",
+      "label": "システムトレイ",
+      "sublabel": "開くと終了",
+      "tag": "方式は未選定",
+      "row": 2,
+      "col": 0
+    },
+    {
+      "id": "windows",
+      "type": "external",
+      "label": "Windows",
+      "sublabel": "保存ダイアログ",
+      "row": 2,
+      "col": 2
+    },
+    {
+      "id": "output",
+      "type": "external",
+      "label": "新しい PDF",
+      "sublabel": "保存先",
+      "tag": "全ページを導入済み",
+      "row": 2,
+      "col": 3
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "この PC の localhost",
+      "wraps": ["webui", "api", "session"]
+    },
+    {
+      "kind": "security-group",
+      "label": "127.0.0.1:8765 のみ",
+      "wraps": ["api"]
+    }
+  ],
+  "connections": [
+    {
+      "id": "open-ui",
+      "from": "editor",
+      "to": "webui",
+      "label": "既定ブラウザで開く",
+      "variant": "emphasis"
+    },
+    {
+      "id": "operate",
+      "from": "webui",
+      "to": "api",
+      "label": "Bearer で操作と Range",
+      "variant": "emphasis"
+    },
+    {
+      "id": "copy-in",
+      "from": "source",
+      "to": "api",
+      "label": "読み込み時にコピー",
+      "variant": "emphasis",
+      "labelDy": 24
+    },
+    {
+      "id": "store-copy",
+      "from": "api",
+      "to": "session",
+      "label": "以後はこのコピー",
+      "variant": "emphasis"
+    },
+    {
+      "id": "save-dialog",
+      "from": "api",
+      "to": "windows",
+      "label": "保存ダイアログを依頼",
+      "labelDy": 24
+    },
+    {
+      "id": "commit-pdf",
+      "from": "api",
+      "to": "output",
+      "label": "検証後に確定",
+      "variant": "emphasis"
+    },
+    {
+      "id": "tray-actions",
+      "from": "tray",
+      "to": "api",
+      "label": "開くと終了",
+      "variant": "dashed"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "編集状態の正本",
+      "items": [
+        "正本は Python。画面は順番・削除・回転を持たない",
+        "ページ実体は書き出し時に pikepdf でコピーする",
+        "本文・パスワード・ファイル名は外部へ送らない"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "導入済みの縦切り",
+      "items": [
+        "1 件の読み込みは作業領域を置き換える",
+        "PDF.js は localhost の Range でセッションコピーを読む",
+        "全ページ書き出しは一時ファイルと検証のあと確定する"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "まだ入っていないもの",
+      "items": [
+        "編集途中の末尾追加と、2 つ目以降の同時読み込み",
+        "回転・削除・並べ替え・分割・Undo の API は未定義",
+        "トレイの実装方式は未選定。実保存ダイアログは未確認"
+      ]
+    }
+  ]
+}

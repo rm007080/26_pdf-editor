@@ -1,0 +1,213 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "PDF編集アプリの動き",
+    "quality_profile": "showcase",
+    "legend": {
+      "mode": "auto",
+      "entries": {
+        "frontend": { "label": "画面" },
+        "backend": { "label": "手元の処理" },
+        "security": { "label": "合言葉" },
+        "external": { "label": "人やファイル" }
+      }
+    },
+    "views": [
+      {
+        "id": "look",
+        "label": "見て選ぶ",
+        "focus": ["reader", "screen", "painter"],
+        "note": "PDFを渡すと、画面はサムネイルと大きなページを見せる。順番の正解は画面が持たない。"
+      },
+      {
+        "id": "remember",
+        "label": "覚えておく",
+        "focus": ["passphrase", "gate", "original", "notebook"],
+        "note": "受付が手帳を更新する。元のPDFはコピーするだけで、中身は変えず、ロックもしない。"
+      },
+      {
+        "id": "save",
+        "label": "新しいPDFにする",
+        "focus": ["notebook", "maker", "saved"],
+        "note": "残っているページを順にコピーし、開けることとページ数を確認してから、別ファイルとして保存する。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "reader",
+      "type": "external",
+      "label": "使う人",
+      "sublabel": "このパソコンでPDFを選ぶ",
+      "pos": [40, 36],
+      "size": [230, 88]
+    },
+    {
+      "id": "screen",
+      "type": "frontend",
+      "label": "ブラウザの画面",
+      "sublabel": "選ぶ、見る、全部書き出す",
+      "tag": "web/src",
+      "pos": [420, 36],
+      "size": [230, 88]
+    },
+    {
+      "id": "painter",
+      "type": "frontend",
+      "label": "ページを描く係",
+      "sublabel": "見ているページだけ絵にする",
+      "tag": "PDF.js",
+      "pos": [800, 36],
+      "size": [230, 88]
+    },
+    {
+      "id": "passphrase",
+      "type": "security",
+      "label": "起動時の合言葉",
+      "sublabel": "この画面以外は通さない",
+      "tag": "auth.py",
+      "pos": [40, 210],
+      "size": [230, 88]
+    },
+    {
+      "id": "gate",
+      "type": "backend",
+      "label": "このPCの受付",
+      "sublabel": "画面を渡し、依頼を振り分ける",
+      "tag": "FastAPI",
+      "pos": [420, 210],
+      "size": [230, 88]
+    },
+    {
+      "id": "maker",
+      "type": "backend",
+      "label": "新しいPDFを作る係",
+      "sublabel": "確認してから別ファイルへ",
+      "tag": "pikepdf",
+      "pos": [800, 210],
+      "size": [230, 88]
+    },
+    {
+      "id": "original",
+      "type": "external",
+      "label": "元のPDF",
+      "sublabel": "中身は変えず、ロックしない",
+      "pos": [40, 384],
+      "size": [230, 88]
+    },
+    {
+      "id": "notebook",
+      "type": "backend",
+      "label": "編集の手帳",
+      "sublabel": "ページ一覧と作業用コピー",
+      "tag": "session.py",
+      "pos": [420, 384],
+      "size": [230, 88]
+    },
+    {
+      "id": "saved",
+      "type": "external",
+      "label": "保存したPDF",
+      "sublabel": "元とは別の新しいファイル",
+      "pos": [800, 384],
+      "size": [230, 88]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "このパソコンの中",
+      "wraps": ["reader", "screen", "painter", "passphrase", "gate", "maker", "original", "notebook", "saved"]
+    }
+  ],
+  "connections": [
+    {
+      "id": "choose-pdf",
+      "from": "reader",
+      "to": "screen",
+      "label": "PDFを選ぶ",
+      "variant": "emphasis"
+    },
+    {
+      "id": "paint-page",
+      "from": "screen",
+      "to": "painter",
+      "label": "作業用コピーを描く"
+    },
+    {
+      "id": "ask-gate",
+      "from": "screen",
+      "to": "gate",
+      "label": "読み込みと書き出しを頼む",
+      "variant": "emphasis",
+      "labelDy": 24
+    },
+    {
+      "id": "allow-screen",
+      "from": "passphrase",
+      "to": "gate",
+      "label": "この画面だけ通す",
+      "variant": "security"
+    },
+    {
+      "id": "record-pages",
+      "from": "gate",
+      "to": "notebook",
+      "label": "ページ一覧を記録",
+      "variant": "emphasis",
+      "labelDy": 24
+    },
+    {
+      "id": "copy-original",
+      "from": "original",
+      "to": "notebook",
+      "label": "元は変えずコピー",
+      "variant": "dashed"
+    },
+    {
+      "id": "hand-pages",
+      "from": "notebook",
+      "to": "maker",
+      "label": "残ったページを順に渡す",
+      "variant": "emphasis"
+    },
+    {
+      "id": "commit-file",
+      "from": "maker",
+      "to": "saved",
+      "label": "確認できたら確定",
+      "variant": "emphasis",
+      "labelDy": 24
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "画面の係",
+      "items": [
+        "web/src の React が、選ぶ・見る・全部書き出すボタンを出す",
+        "ページの順番の正解は持たない。api.ts が依頼を受付へ届ける",
+        "pdf.ts の PDF.js が、見ているページだけを絵にする"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "覚えておく係",
+      "items": [
+        "app/__main__.py がブラウザを開き、このPCの 127.0.0.1 だけで待つ",
+        "session.py がページ一覧と、Windows 一時フォルダの作業用コピーを持つ",
+        "auth.py が起動ごとに合言葉を作り、画面以外の依頼を拒む"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "書き出す係",
+      "items": [
+        "export.py の pikepdf が、残ったページを一時ファイルへコピーする",
+        "PDFとして開けることと、ページ数が合うことを確認してから確定する",
+        "save_dialog.py が保存先を聞き、open_path.py が保存後にファイルを開く"
+      ]
+    }
+  ]
+}
