@@ -31,6 +31,8 @@ class Session:
         self._activity = Activity.IDLE
         self.documents: list[dict[str, str]] = []
         self.pages: list[dict[str, object]] = []
+        self.selected_page_ids: list[str] = []
+        self.active_page_id: str | None = None
         self.session_file: Path | None = None
         self.pause_during_load = None
         self.before_commit = None
@@ -42,6 +44,8 @@ class Session:
         with self._lock:
             self.documents = []
             self.pages = []
+            self.selected_page_ids = []
+            self.active_page_id = None
             self.session_file = None
             self._activity = Activity.IDLE
 
@@ -73,12 +77,58 @@ class Session:
         with self._lock:
             self._activity = Activity.DIALOG
 
-    def snapshot(self) -> dict[str, list]:
+    def snapshot(self) -> dict[str, object]:
         with self._lock:
-            return {
-                "documents": [dict(item) for item in self.documents],
-                "pages": [dict(item) for item in self.pages],
-            }
+            return self._snapshot_unlocked()
+
+    def update_selection(self, body: object) -> tuple[int, dict]:
+        with self._lock:
+            if self._activity is not Activity.IDLE:
+                return 409, {"detail": "読み込み中、ダイアログ中、または書き出し中のため選択を変更できません"}
+            if not isinstance(body, dict) or "selected_page_ids" not in body or "active_page_id" not in body:
+                return 400, {"detail": "選択の指定が不正です"}
+            detail = self._selection_error(body["selected_page_ids"], body["active_page_id"])
+            if detail is not None:
+                return 400, {"detail": detail}
+            self.selected_page_ids = self._sorted_ids(body["selected_page_ids"])
+            self.active_page_id = body["active_page_id"]
+            return 200, self._snapshot_unlocked()
+
+    def _snapshot_unlocked(self) -> dict[str, object]:
+        return {
+            "documents": [dict(item) for item in self.documents],
+            "pages": [dict(item) for item in self.pages],
+            "selected_page_ids": self._sorted_ids(self.selected_page_ids),
+            "active_page_id": self.active_page_id,
+        }
+
+    def _visible_pages_unlocked(self) -> list[dict[str, object]]:
+        pages = [page for page in self.pages if not page["deleted"]]
+        pages.sort(key=lambda page: page["order"])
+        return pages
+
+    def _sorted_ids(self, page_ids: list[str]) -> list[str]:
+        order = {page["id"]: index for index, page in enumerate(self._visible_pages_unlocked())}
+        return sorted(page_ids, key=lambda page_id: order.get(page_id, len(order)))
+
+    def _selection_error(self, selected: object, active: object) -> str | None:
+        if not isinstance(selected, list) or any(not isinstance(page_id, str) for page_id in selected):
+            return "選択の指定が不正です"
+        if active is not None and not isinstance(active, str):
+            return "選択の指定が不正です"
+        if len(selected) != len(set(selected)):
+            return "ページの識別子が重複しています"
+        known = {page["id"] for page in self.pages}
+        visible = {page["id"] for page in self._visible_pages_unlocked()}
+        for page_id in selected:
+            if page_id not in known:
+                return "不明なページは選択できません"
+            if page_id not in visible:
+                return "見えていないページは選択できません"
+        if not isinstance(active, str) or active not in selected:
+            if selected or active is not None:
+                return "アクティブページが選択に含まれていません"
+        return None
 
     def session_file_path(self) -> Path | None:
         with self._lock:
@@ -117,6 +167,14 @@ class Session:
             previous = self.session_file
             self.documents = [document]
             self.pages = pages
+            visible = [page for page in pages if not page["deleted"]]
+            visible.sort(key=lambda page: page["order"])
+            if visible:
+                self.selected_page_ids = [str(visible[0]["id"])]
+                self.active_page_id = str(visible[0]["id"])
+            else:
+                self.selected_page_ids = []
+                self.active_page_id = None
             self.session_file = staging
             self._activity = Activity.IDLE
         if previous is not None and previous != staging and previous.exists():

@@ -15,6 +15,17 @@ export type DocumentRecord = {
 export type SessionState = {
   documents: DocumentRecord[];
   pages: PageRecord[];
+  selected_page_ids: string[];
+  active_page_id: string | null;
+};
+
+export type ThumbnailLayout = "row" | "grid";
+export type ThumbnailSize = "small" | "medium" | "large";
+
+export type ViewSettings = {
+  thumbnail_layout: ThumbnailLayout;
+  thumbnail_size: ThumbnailSize;
+  pane_ratio: number | null;
 };
 
 export type ExportStage = "copying" | "verifying" | "committing" | "completed" | "failed";

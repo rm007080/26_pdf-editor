@@ -1,9 +1,33 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type PointerEvent as ReactPointerEvent } from "react";
 import type { PDFDocumentProxy } from "pdfjs-dist";
-import { getExportJob, getSession, openSaved, postDocument, postExport, readToken } from "./api";
+import {
+  ApiError,
+  getExportJob,
+  getSession,
+  getSettings,
+  openSaved,
+  patchSelection,
+  postDocument,
+  postExport,
+  putSettings,
+  readToken,
+} from "./api";
+import { FRAME_HEIGHT, SPLITTER, oneRowHeight, paneHeights, ratioFromThumb } from "./panes";
 import { openSessionPdf } from "./pdf";
-import { FittedCanvas, ThumbnailStrip, visiblePages } from "./Preview";
-import type { ExportJob, SessionState } from "./types";
+import { ThumbnailStrip, ZoomPreview, visiblePages } from "./Preview";
+import {
+  clearSelection,
+  ctrlClick,
+  extendBy,
+  moveBy,
+  selectAll,
+  selectionForPageNumber,
+  shiftClick,
+  singleSelection,
+  type PageSelection,
+} from "./selection";
+import type { ExportJob, SessionState, ThumbnailLayout, ThumbnailSize, ViewSettings } from "./types";
+import { changeZoom, formatPercent, initialZoom, zoomUnchanged, type NamedZoom, type ZoomMetrics, type ZoomState } from "./zoom";
 
 const stageLabel: Record<ExportJob["stage"], string> = {
   copying: "コピー中",
@@ -13,7 +37,21 @@ const stageLabel: Record<ExportJob["stage"], string> = {
   failed: "失敗",
 };
 
-const emptySession: SessionState = { documents: [], pages: [] };
+const emptySession: SessionState = {
+  documents: [],
+  pages: [],
+  selected_page_ids: [],
+  active_page_id: null,
+};
+
+const defaultSettings: ViewSettings = {
+  thumbnail_layout: "row",
+  thumbnail_size: "medium",
+  pane_ratio: null,
+};
+
+const selectPrompt = "ページを選択してください";
+const noPageReason = "ページが選択されていないため使えません。ページを選択すると使えます。";
 
 function fileNameOf(path: string): string {
   const parts = path.split(/[/\\]/);
@@ -31,23 +69,80 @@ function delay(ms: number): Promise<void> {
   });
 }
 
+function isTextField(target: EventTarget | null): boolean {
+  return target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement;
+}
+
+function TipButton({
+  label,
+  disabled,
+  reason,
+  pressed,
+  onClick,
+}: {
+  label: string;
+  disabled?: boolean;
+  reason?: string;
+  pressed?: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <span className="tip" title={disabled ? reason : undefined}>
+      <button type="button" disabled={disabled} aria-pressed={pressed} onClick={onClick}>
+        {label}
+      </button>
+    </span>
+  );
+}
+
 export function App() {
   const token = useMemo(() => readToken(), []);
   const [session, setSession] = useState<SessionState>(emptySession);
-  const [currentPage, setCurrentPage] = useState(1);
+  const [settings, setSettings] = useState<ViewSettings>(defaultSettings);
+  const [settingsReady, setSettingsReady] = useState(false);
   const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [waiting, setWaiting] = useState<string | null>(null);
   const [progress, setProgress] = useState<ExportJob | null>(null);
   const [saved, setSaved] = useState<{ jobId: string; path: string } | null>(null);
   const [busy, setBusy] = useState(false);
+  const [jumpText, setJumpText] = useState("");
+  const [zoom, setZoom] = useState<ZoomState>(initialZoom);
+  const [metrics, setMetrics] = useState<ZoomMetrics | null>(null);
+  const [workspaceHeight, setWorkspaceHeight] = useState(0);
+  const [dragRatio, setDragRatio] = useState<number | null>(null);
+  const [columns, setColumns] = useState(1);
+  const workspaceRef = useRef<HTMLDivElement>(null);
+  const thumbsRef = useRef<HTMLElement>(null);
+  const anchorRef = useRef<string | null>(null);
+  const ticketRef = useRef(0);
+  const zoomRef = useRef(zoom);
+  const metricsRef = useRef(metrics);
+  const sessionRef = useRef(session);
+  const settingsRef = useRef(settings);
+  const columnsRef = useRef(columns);
+  zoomRef.current = zoom;
+  metricsRef.current = metrics;
+  sessionRef.current = session;
+  settingsRef.current = settings;
+  columnsRef.current = columns;
+
   const pages = visiblePages(session.pages);
   const names = useMemo(
     () => new Map(session.documents.map((document) => [document.id, document.filename])),
     [session.documents],
   );
-  const active = pages.find((page) => page.order === currentPage) ?? null;
+  const active = pages.find((page) => page.id === session.active_page_id) ?? null;
   const documentId = session.documents[0]?.id ?? "";
+  const frameHeight = FRAME_HEIGHT[settings.thumbnail_size];
+  const available = Math.max(0, workspaceHeight - SPLITTER);
+  const heights = paneHeights(available, dragRatio ?? settings.pane_ratio, oneRowHeight(settings.thumbnail_size));
+  const onMetrics = useCallback((next: ZoomMetrics | null) => {
+    setMetrics(next);
+  }, []);
+  const onColumns = useCallback((count: number) => {
+    setColumns(count);
+  }, []);
 
   useEffect(() => {
     let activeRequest = true;
@@ -57,19 +152,45 @@ export function App() {
           return;
         }
         setSession(next);
-        if (visiblePages(next.pages).length > 0) {
-          setCurrentPage(1);
-        }
+        anchorRef.current = next.active_page_id;
       })
       .catch((reason: unknown) => {
         if (activeRequest) {
           setError(reason instanceof Error ? reason.message : "編集状態を読めませんでした");
         }
       });
+    getSettings(token)
+      .then((next) => {
+        if (activeRequest) {
+          setSettings(next);
+        }
+      })
+      .catch((reason: unknown) => {
+        if (activeRequest) {
+          setError(reason instanceof Error ? reason.message : "設定を読めませんでした");
+        }
+      })
+      .finally(() => {
+        if (activeRequest) {
+          setSettingsReady(true);
+        }
+      });
     return () => {
       activeRequest = false;
     };
   }, [token]);
+
+  useEffect(() => {
+    const node = workspaceRef.current;
+    if (!node) {
+      return;
+    }
+    const update = () => setWorkspaceHeight(node.clientHeight);
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
 
   useEffect(() => {
     if (!documentId) {
@@ -98,6 +219,131 @@ export function App() {
     };
   }, [token, documentId]);
 
+  async function applySelection(next: PageSelection, keepAnchor = false): Promise<boolean> {
+    const ticket = ++ticketRef.current;
+    try {
+      const updated = await patchSelection(token, next.selected_page_ids, next.active_page_id);
+      if (ticket !== ticketRef.current) {
+        return false;
+      }
+      setSession(updated);
+      if (!keepAnchor) {
+        anchorRef.current = updated.active_page_id;
+      }
+      return true;
+    } catch (reason: unknown) {
+      if (reason instanceof ApiError && (reason.status === 400 || reason.status === 409)) {
+        return false;
+      }
+      setError(reason instanceof Error ? reason.message : "選択を更新できませんでした");
+      return false;
+    }
+  }
+
+  async function saveSettings(next: ViewSettings) {
+    if (!settingsReady) {
+      return;
+    }
+    const previous = settingsRef.current;
+    setSettings(next);
+    try {
+      const savedSettings = await putSettings(token, next);
+      setSettings(savedSettings);
+    } catch (reason: unknown) {
+      setSettings(previous);
+      setError(reason instanceof Error ? reason.message : "設定を保存できませんでした");
+    }
+  }
+
+  function stepZoom(direction: 1 | -1) {
+    const currentMetrics = metricsRef.current;
+    if (!currentMetrics || !sessionRef.current.active_page_id) {
+      return;
+    }
+    const next = changeZoom(zoomRef.current, currentMetrics.effective, direction);
+    zoomRef.current = next;
+    setZoom(next);
+  }
+
+  function move(delta: number) {
+    const current = sessionRef.current;
+    if (!current.active_page_id) {
+      return;
+    }
+    const next = moveBy(visiblePages(current.pages), current.active_page_id, delta);
+    if (next) {
+      void applySelection(next);
+    }
+  }
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (isTextField(event.target)) {
+        return;
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        void applySelection(clearSelection());
+        return;
+      }
+      const current = sessionRef.current;
+      const visible = visiblePages(current.pages);
+      if (event.ctrlKey && event.key.toLowerCase() === "a") {
+        const thumbs = thumbsRef.current;
+        if (!thumbs || !(event.target instanceof Node) || !thumbs.contains(event.target)) {
+          return;
+        }
+        event.preventDefault();
+        void applySelection(selectAll(visible, current));
+        return;
+      }
+      const keyDelta: Record<string, number> = {
+        ArrowLeft: -1,
+        ArrowRight: 1,
+        ArrowUp: settingsRef.current.thumbnail_layout === "grid" ? -columnsRef.current : 0,
+        ArrowDown: settingsRef.current.thumbnail_layout === "grid" ? columnsRef.current : 0,
+      };
+      const delta = keyDelta[event.key];
+      if (!delta || !current.active_page_id) {
+        return;
+      }
+      event.preventDefault();
+      if (event.shiftKey) {
+        const anchor = anchorRef.current;
+        if (!anchor) {
+          return;
+        }
+        const next = extendBy(visible, anchor, current.active_page_id, delta);
+        if (next) {
+          void applySelection(next, true);
+        }
+        return;
+      }
+      const next = moveBy(visible, current.active_page_id, delta);
+      if (next) {
+        void applySelection(next);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [token]);
+
+  useEffect(() => {
+    const onWheel = (event: WheelEvent) => {
+      if (!event.ctrlKey || isTextField(event.target)) {
+        return;
+      }
+      event.preventDefault();
+      if (event.deltaY < 0) {
+        stepZoom(1);
+      } else if (event.deltaY > 0) {
+        stepZoom(-1);
+      }
+    };
+    window.addEventListener("wheel", onWheel, { passive: false });
+    return () => window.removeEventListener("wheel", onWheel);
+  }, [token]);
+
   async function chooseFile(file: File | undefined) {
     if (!file) {
       return;
@@ -108,7 +354,7 @@ export function App() {
     try {
       const next = await postDocument(token, file);
       setSession(next);
-      setCurrentPage(1);
+      anchorRef.current = next.active_page_id;
     } catch (reason: unknown) {
       setError(reason instanceof Error ? reason.message : "読み込めませんでした");
     }
@@ -160,6 +406,106 @@ export function App() {
     }
   }
 
+  function activate(pageId: string, mode: "single" | "toggle" | "range") {
+    const current = sessionRef.current;
+    const visible = visiblePages(current.pages);
+    if (mode === "toggle") {
+      void applySelection(ctrlClick(visible, current, pageId));
+      return;
+    }
+    if (mode === "range") {
+      void applySelection(shiftClick(visible, current, pageId));
+      return;
+    }
+    void applySelection(singleSelection(pageId));
+  }
+
+  async function jump(event: FormEvent) {
+    event.preventDefault();
+    const next = selectionForPageNumber(pages, jumpText);
+    if (!next) {
+      setError("ページ番号が範囲外です");
+      return;
+    }
+    const ok = await applySelection(next);
+    if (ok) {
+      setJumpText("");
+    }
+  }
+
+  function chooseLayout(layout: ThumbnailLayout) {
+    void saveSettings({ ...settings, thumbnail_layout: layout });
+  }
+
+  function chooseSize(size: ThumbnailSize) {
+    void saveSettings({ ...settings, thumbnail_size: size });
+  }
+
+  function chooseZoom(mode: NamedZoom) {
+    const next: ZoomState = { kind: "named", mode };
+    zoomRef.current = next;
+    setZoom(next);
+  }
+
+  function onSplitterPointerDown(event: ReactPointerEvent<HTMLDivElement>) {
+    if (!settingsReady) {
+      return;
+    }
+    event.preventDefault();
+    const handle = event.currentTarget;
+    handle.setPointerCapture(event.pointerId);
+    const startY = event.clientY;
+    const startThumb = heights.thumbs;
+    const space = available;
+    const move = (ev: PointerEvent) => {
+      const next = ratioFromThumb(space, startThumb - (ev.clientY - startY));
+      if (next != null) {
+        setDragRatio(next);
+      }
+    };
+    const up = (ev: PointerEvent) => {
+      handle.removeEventListener("pointermove", move);
+      handle.removeEventListener("pointerup", up);
+      const next = ratioFromThumb(space, startThumb - (ev.clientY - startY));
+      setDragRatio(null);
+      if (next != null) {
+        void saveSettings({ ...settingsRef.current, pane_ratio: next });
+      }
+    };
+    handle.addEventListener("pointermove", move);
+    handle.addEventListener("pointerup", up);
+  }
+
+  const activeIndex = active ? pages.findIndex((page) => page.id === active.id) : -1;
+  const previousReason =
+    !active ? noPageReason : activeIndex <= 0 ? "先頭のページのため使えません。後ろにページがあるときに使えます。" : undefined;
+  const nextReason =
+    !active
+      ? noPageReason
+      : activeIndex < 0 || activeIndex >= pages.length - 1
+        ? "末尾のページのため使えません。前にページがあるときに使えます。"
+        : undefined;
+  const waitingForSize = "表示の寸法を測っています。測り終わると使えます。";
+  const zoomOutReason = !active
+    ? noPageReason
+    : !metrics
+      ? waitingForSize
+    : zoomUnchanged(zoom, metrics.effective, -1)
+      ? zoom.kind === "named" && metrics.effective < 25
+        ? "表示が25%未満のため縮小できません。拡大すると25%から段階を変えられます。"
+        : "25%より小さくできないため使えません。25%より大きい表示のときに使えます。"
+      : undefined;
+  const zoomInReason = !active
+    ? noPageReason
+    : !metrics
+      ? waitingForSize
+    : zoomUnchanged(zoom, metrics.effective, 1)
+      ? "400%より大きくできないため使えません。400%より小さい表示のときに使えます。"
+      : undefined;
+
+  const emptyMessage =
+    pages.length === 0 ? "PDF を選ぶと、1 ページ目がここに表示されます。" : active ? null : selectPrompt;
+
   return (
     <div className="app">
       <header className="toolbar">
@@ -176,20 +522,76 @@ export function App() {
             }}
           />
         </label>
-        <button type="button" disabled={!active || currentPage <= 1} onClick={() => setCurrentPage((page) => page - 1)}>
-          前のページ
-        </button>
-        <button
-          type="button"
-          disabled={!active || currentPage >= pages.length}
-          onClick={() => setCurrentPage((page) => page + 1)}
-        >
-          次のページ
-        </button>
+        <TipButton label="前へ" disabled={previousReason !== undefined} reason={previousReason} onClick={() => move(-1)} />
+        <TipButton label="次へ" disabled={nextReason !== undefined} reason={nextReason} onClick={() => move(1)} />
+        <TipButton
+          label="ページ全体"
+          pressed={zoom.kind === "named" && zoom.mode === "fit-page"}
+          onClick={() => chooseZoom("fit-page")}
+        />
+        <TipButton
+          label="幅に合わせる"
+          pressed={zoom.kind === "named" && zoom.mode === "fit-width"}
+          onClick={() => chooseZoom("fit-width")}
+        />
+        <TipButton
+          label="100%"
+          pressed={zoom.kind === "named" && zoom.mode === "actual"}
+          onClick={() => chooseZoom("actual")}
+        />
+        <TipButton label="−" disabled={zoomOutReason !== undefined} reason={zoomOutReason} onClick={() => stepZoom(-1)} />
+        <TipButton label="＋" disabled={zoomInReason !== undefined} reason={zoomInReason} onClick={() => stepZoom(1)} />
+        <span className="zoom-label">{metrics && active ? formatPercent(metrics.effective) : ""}</span>
+        <TipButton
+          label="横一列"
+          pressed={settings.thumbnail_layout === "row"}
+          disabled={!settingsReady}
+          reason="設定の読み込みが終わると使えます。"
+          onClick={() => chooseLayout("row")}
+        />
+        <TipButton
+          label="複数列"
+          pressed={settings.thumbnail_layout === "grid"}
+          disabled={!settingsReady}
+          reason="設定の読み込みが終わると使えます。"
+          onClick={() => chooseLayout("grid")}
+        />
+        <TipButton
+          label="小"
+          pressed={settings.thumbnail_size === "small"}
+          disabled={!settingsReady}
+          reason="設定の読み込みが終わると使えます。"
+          onClick={() => chooseSize("small")}
+        />
+        <TipButton
+          label="中"
+          pressed={settings.thumbnail_size === "medium"}
+          disabled={!settingsReady}
+          reason="設定の読み込みが終わると使えます。"
+          onClick={() => chooseSize("medium")}
+        />
+        <TipButton
+          label="大"
+          pressed={settings.thumbnail_size === "large"}
+          disabled={!settingsReady}
+          reason="設定の読み込みが終わると使えます。"
+          onClick={() => chooseSize("large")}
+        />
         <button type="button" className="export-button" disabled={pages.length === 0 || busy} onClick={() => void exportAll()}>
           全ページを書き出す
         </button>
-        <span className="page-label">{active ? `${currentPage} / ${pages.length}` : "ページなし"}</span>
+        <form className="jump" onSubmit={(event) => void jump(event)}>
+          <input
+            aria-label="ページ番号"
+            inputMode="numeric"
+            value={jumpText}
+            onChange={(event) => setJumpText(event.target.value)}
+          />
+          <button type="submit">移動</button>
+        </form>
+        <span className="page-label">
+          総ページ数 {pages.length}　選択ページ数 {session.selected_page_ids.length}　元 PDF 数 {session.documents.length}
+        </span>
       </header>
       {error ? (
         <p className="notice">
@@ -218,22 +620,47 @@ export function App() {
           </button>
         </div>
       ) : null}
-      <main className="stage">
-        {pdf && active ? (
-          <FittedCanvas pdf={pdf} sourcePage={active.source_page} className="preview-frame" />
-        ) : (
-          <p className="empty">PDF を選ぶと、1 ページ目がここに表示されます。</p>
-        )}
-      </main>
-      {pdf && pages.length > 0 ? (
-        <ThumbnailStrip
-          pdf={pdf}
-          pages={pages}
-          names={names}
-          currentPage={currentPage}
-          onSelect={setCurrentPage}
+      <div className="workspace" ref={workspaceRef}>
+        <main
+          className="stage"
+          style={{ height: heights.preview }}
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) {
+              void applySelection(clearSelection());
+            }
+          }}
+        >
+          {pdf && active ? (
+            <ZoomPreview pdf={pdf} pages={pages} activeId={active.id} zoom={zoom} onMetrics={onMetrics} />
+          ) : emptyMessage ? (
+            <p className="empty">{emptyMessage}</p>
+          ) : null}
+        </main>
+        <div
+          className="splitter"
+          role="separator"
+          aria-orientation="horizontal"
+          aria-label="プレビューとサムネイルの境界"
+          tabIndex={0}
+          onPointerDown={onSplitterPointerDown}
         />
-      ) : null}
+        <section className="thumb-pane" style={{ height: heights.thumbs }} ref={thumbsRef}>
+          {pdf && pages.length > 0 ? (
+            <ThumbnailStrip
+              pdf={pdf}
+              pages={pages}
+              names={names}
+              selectedIds={session.selected_page_ids}
+              activeId={session.active_page_id}
+              layout={settings.thumbnail_layout}
+              frameHeight={frameHeight}
+              onActivate={activate}
+              onBlank={() => void applySelection(clearSelection())}
+              onColumns={onColumns}
+            />
+          ) : null}
+        </section>
+      </div>
     </div>
   );
 }

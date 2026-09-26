@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from app.auth import bearer_matches, new_token
 from app.export import ExportService
 from app.session import Session
+from app.settings import SettingsStore
 
 DIST_DIR = Path(__file__).resolve().parent.parent / "web" / "dist"
 DIST_INDEX = DIST_DIR / "index.html"
@@ -40,8 +41,9 @@ def render_index(token: str) -> str:
     return html.replace(TOKEN_PLACEHOLDER, token)
 
 
-def create_app(session: Session | None = None) -> FastAPI:
+def create_app(session: Session | None = None, settings_path: Path | None = None) -> FastAPI:
     session = session or Session()
+    settings = SettingsStore(settings_path)
     development = _development_enabled()
 
     @asynccontextmanager
@@ -72,9 +74,31 @@ def create_app(session: Session | None = None) -> FastAPI:
     def index() -> str:
         return render_index(app.state.token)
 
+    @app.get("/api/settings")
+    def get_settings() -> dict:
+        return settings.read()
+
+    @app.put("/api/settings")
+    async def put_settings(request: Request) -> JSONResponse:
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse(status_code=400, content={"detail": "設定の指定が不正です"})
+        status, payload = settings.write(body)
+        return JSONResponse(status_code=status, content=payload)
+
     @app.get("/api/session")
     def get_session() -> dict:
         return session.snapshot()
+
+    @app.patch("/api/session/selection")
+    async def patch_selection(request: Request) -> JSONResponse:
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse(status_code=400, content={"detail": "選択の指定が不正です"})
+        status, payload = session.update_selection(body)
+        return JSONResponse(status_code=status, content=payload)
 
     @app.post("/api/documents")
     async def post_document(file: UploadFile = File(...)) -> JSONResponse:

@@ -1,4 +1,14 @@
-import type { ExportJob, ExportStart, SessionState } from "./types";
+import type { ExportJob, ExportStart, SessionState, ViewSettings } from "./types";
+
+export class ApiError extends Error {
+  readonly status: number;
+
+  constructor(status: number, detail: string) {
+    super(detail);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
 
 export function readToken(): string {
   const content = document.querySelector('meta[name="pdf-editor-token"]')?.getAttribute("content") ?? "";
@@ -17,9 +27,33 @@ async function request(token: string, path: string, init?: RequestInit): Promise
 async function readJson<T>(response: Response): Promise<T> {
   const body = (await response.json()) as T & { detail?: string };
   if (!response.ok) {
-    throw new Error(body.detail || "処理に失敗しました");
+    throw new ApiError(response.status, body.detail || "処理に失敗しました");
   }
   return body;
+}
+
+export function getSettings(token: string): Promise<ViewSettings> {
+  return request(token, "/api/settings").then((response) => readJson<ViewSettings>(response));
+}
+
+export function putSettings(token: string, settings: ViewSettings): Promise<ViewSettings> {
+  return request(token, "/api/settings", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(settings),
+  }).then((response) => readJson<ViewSettings>(response));
+}
+
+export function patchSelection(
+  token: string,
+  selectedPageIds: string[],
+  activePageId: string | null,
+): Promise<SessionState> {
+  return request(token, "/api/session/selection", {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ selected_page_ids: selectedPageIds, active_page_id: activePageId }),
+  }).then((response) => readJson<SessionState>(response));
 }
 
 export function getSession(token: string): Promise<SessionState> {
