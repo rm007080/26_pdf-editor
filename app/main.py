@@ -33,6 +33,13 @@ def _development_enabled() -> bool:
     return os.environ.get("PDF_EDITOR_ENV", "development") == "development"
 
 
+async def read_json_body(request: Request, invalid_detail: str) -> tuple[object, JSONResponse | None]:
+    try:
+        return await request.json(), None
+    except Exception:
+        return None, JSONResponse(status_code=400, content={"detail": invalid_detail})
+
+
 def render_index(token: str) -> str:
     if DIST_INDEX.is_file():
         html = DIST_INDEX.read_text(encoding="utf-8")
@@ -80,10 +87,9 @@ def create_app(session: Session | None = None, settings_path: Path | None = None
 
     @app.put("/api/settings")
     async def put_settings(request: Request) -> JSONResponse:
-        try:
-            body = await request.json()
-        except Exception:
-            return JSONResponse(status_code=400, content={"detail": "設定の指定が不正です"})
+        body, error = await read_json_body(request, "設定の指定が不正です")
+        if error is not None:
+            return error
         status, payload = settings.write(body)
         return JSONResponse(status_code=status, content=payload)
 
@@ -93,11 +99,18 @@ def create_app(session: Session | None = None, settings_path: Path | None = None
 
     @app.patch("/api/session/selection")
     async def patch_selection(request: Request) -> JSONResponse:
-        try:
-            body = await request.json()
-        except Exception:
-            return JSONResponse(status_code=400, content={"detail": "選択の指定が不正です"})
+        body, error = await read_json_body(request, "選択の指定が不正です")
+        if error is not None:
+            return error
         status, payload = session.update_selection(body)
+        return JSONResponse(status_code=status, content=payload)
+
+    @app.post("/api/session/commands")
+    async def post_commands(request: Request) -> JSONResponse:
+        body, error = await read_json_body(request, "コマンドの指定が不正です")
+        if error is not None:
+            return error
+        status, payload = session.apply_command(body)
         return JSONResponse(status_code=status, content=payload)
 
     @app.post("/api/documents")

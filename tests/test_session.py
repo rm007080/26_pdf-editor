@@ -62,6 +62,10 @@ def test_empty_session(env):
         "pages": [],
         "selected_page_ids": [],
         "active_page_id": None,
+        "undo_enabled": False,
+        "redo_enabled": False,
+        "undo_hint": "元に戻せる操作がありません。実行しても状態は変わりません",
+        "redo_hint": "やり直せる操作がありません。実行しても状態は変わりません",
     }
 
 
@@ -421,5 +425,467 @@ def test_session_file_without_token_is_rejected(env, tmp_path):
     assert post_file(client, app, source).status_code == 200
 
     response = client.get("/api/session/file")
+
+    assert response.status_code == 401
+
+
+def post_command(client: TestClient, app, body, headers=None):
+    return client.post(
+        "/api/session/commands",
+        headers=auth(app) if headers is None else headers,
+        json=body,
+    )
+
+
+def without_command_flags(body: dict) -> tuple[dict, bool, bool]:
+    rest = dict(body)
+    changed = rest.pop("changed")
+    dropped = rest.pop("history_dropped")
+    return rest, changed, dropped
+
+
+def page_ids(body: dict) -> list[str]:
+    return [page["id"] for page in body["pages"]]
+
+
+def test_rotate_is_one_undo_and_redo_restores_angle_and_selection(env, tmp_path):
+    client, app, session = env
+    source = tmp_path / "sample.pdf"
+    write_pdf(source, pages=3)
+    original = source.read_bytes()
+    loaded = post_file(client, app, source).json()
+    ids = page_ids(loaded)
+    assert patch_selection(client, app, [ids[0], ids[2]], ids[2]).status_code == 200
+
+    response = post_command(
+        client,
+        app,
+        {"type": "rotate", "page_ids": [ids[2], ids[0]], "direction": "right"},
+    )
+
+    assert response.status_code == 200
+    rest, changed, dropped = without_command_flags(response.json())
+    assert changed is True
+    assert dropped is False
+    assert [page["rotation"] for page in rest["pages"]] == [90, 0, 90]
+    assert rest["selected_page_ids"] == [ids[0], ids[2]]
+    assert rest["active_page_id"] == ids[2]
+    assert rest["undo_enabled"] is True
+    assert rest["undo_hint"] == "左に90度回転する"
+    assert rest["redo_enabled"] is False
+    fetched = client.get("/api/session", headers=auth(app)).json()
+    assert "changed" not in fetched
+    assert "history_dropped" not in fetched
+    assert fetched == rest
+    assert source.read_bytes() == original
+    assert len(list(session.temp_dir.iterdir())) == 1
+
+    undone = post_command(client, app, {"type": "undo"})
+    assert undone.status_code == 200
+    undone_body, changed, dropped = without_command_flags(undone.json())
+    assert changed is True and dropped is False
+    assert [page["rotation"] for page in undone_body["pages"]] == [0, 0, 0]
+    assert undone_body["selected_page_ids"] == [ids[0], ids[2]]
+    assert undone_body["active_page_id"] == ids[2]
+    assert undone_body["undo_enabled"] is False
+    assert undone_body["redo_enabled"] is True
+    assert undone_body["redo_hint"] == "右に90度回転する"
+
+    redone = post_command(client, app, {"type": "redo"})
+    assert redone.status_code == 200
+    redone_body, changed, _dropped = without_command_flags(redone.json())
+    assert changed is True
+    assert [page["rotation"] for page in redone_body["pages"]] == [90, 0, 90]
+    assert redone_body["selected_page_ids"] == [ids[0], ids[2]]
+    assert redone_body["active_page_id"] == ids[2]
+    assert post_command(client, app, {"type": "redo"}).status_code == 400
+    assert client.get("/api/session", headers=auth(app)).json() == redone_body
+
+
+def test_four_rotations_return_to_zero(env, tmp_path):
+    client, app, _session = env
+    source = tmp_path / "sample.pdf"
+    write_pdf(source, pages=1)
+    loaded = post_file(client, app, source).json()
+    page_id = loaded["pages"][0]["id"]
+
+    for _ in range(4):
+        assert post_command(client, app, {"type": "rotate", "page_ids": [page_id], "direction": "right"}).status_code == 200
+    assert client.get("/api/session", headers=auth(app)).json()["pages"][0]["rotation"] == 0
+
+    for _ in range(4):
+        assert post_command(client, app, {"type": "rotate", "page_ids": [page_id], "direction": "left"}).status_code == 200
+    assert client.get("/api/session", headers=auth(app)).json()["pages"][0]["rotation"] == 0
+
+
+def test_invalid_commands_leave_pages_selection_and_history(env, tmp_path):
+    client, app, _session = env
+    source = tmp_path / "sample.pdf"
+    write_pdf(source, pages=3)
+    loaded = post_file(client, app, source).json()
+    ids = page_ids(loaded)
+    assert post_command(client, app, {"type": "rotate", "page_ids": [ids[0]], "direction": "right"}).status_code == 200
+    before = client.get("/api/session", headers=auth(app)).json()
+
+    cases = [
+        {"type": "restore_deleted", "pages": []},
+        {"type": "restore_order", "pages": []},
+        {"type": "crop"},
+        {"type": "rotate", "page_ids": [], "direction": "right"},
+        {"type": "rotate", "page_ids": [ids[0], ids[0]], "direction": "right"},
+        {"type": "rotate", "page_ids": ["missing"], "direction": "right"},
+        {"type": "rotate", "page_ids": [ids[0]], "direction": "up"},
+        {"type": "delete", "page_ids": []},
+        {"type": "reorder", "page_ids": [ids[1]]},
+        {"type": "reorder", "page_ids": [ids[1]], "before_page_id": ids[0], "after_page_id": ids[2]},
+        {"type": "reorder", "page_ids": [ids[1]], "before_page_id": ids[1]},
+        {"type": "reorder", "page_ids": [ids[0], ids[1]], "before_page_id": ids[2]},
+        {"type": "reorder", "page_ids": [ids[1], ids[2]], "after_page_id": ids[0]},
+        {"page_ids": [ids[0]]},
+    ]
+    for body in cases:
+        response = post_command(client, app, body)
+        assert response.status_code == 400, body
+        assert client.get("/api/session", headers=auth(app)).json() == before
+
+    broken = client.post(
+        "/api/session/commands",
+        headers={**auth(app), "Content-Type": "application/json"},
+        content=b"{",
+    )
+    assert broken.status_code == 400
+    assert client.get("/api/session", headers=auth(app)).json() == before
+
+    # 上の rotate が履歴に残っているので、空の undo は 400 にならない。一度戻してから拒否する。
+    assert post_command(client, app, {"type": "undo"}).status_code == 200
+    empty = client.get("/api/session", headers=auth(app)).json()
+    assert empty["pages"][0]["rotation"] == 0
+    rejected = post_command(client, app, {"type": "undo"})
+    assert rejected.status_code == 400
+    assert client.get("/api/session", headers=auth(app)).json() == empty
+    rejected_redo = post_command(client, app, {"type": "redo"})
+    assert rejected_redo.status_code == 200
+    exhausted = post_command(client, app, {"type": "redo"})
+    assert exhausted.status_code == 400
+    assert client.get("/api/session", headers=auth(app)).json()["pages"][0]["rotation"] == 90
+
+
+@pytest.mark.parametrize("activity", [Activity.LOADING, Activity.DIALOG, Activity.EXPORTING])
+def test_command_conflicts_while_busy(env, tmp_path, activity):
+    client, app, session = env
+    source = tmp_path / "sample.pdf"
+    write_pdf(source, pages=1)
+    loaded = post_file(client, app, source).json()
+    before = client.get("/api/session", headers=auth(app)).json()
+    assert session.try_begin(activity)
+
+    response = post_command(
+        client,
+        app,
+        {"type": "rotate", "page_ids": [loaded["pages"][0]["id"]], "direction": "right"},
+    )
+    during = client.get("/api/session", headers=auth(app)).json()
+    session.finish(activity)
+
+    assert response.status_code == 409
+    assert during == before
+    assert before["pages"][0]["rotation"] == 0
+    assert before["undo_enabled"] is False
+
+
+def test_noop_reorder_does_not_enter_history(env, tmp_path):
+    client, app, _session = env
+    source = tmp_path / "sample.pdf"
+    write_pdf(source, pages=3)
+    loaded = post_file(client, app, source).json()
+    ids = page_ids(loaded)
+    assert post_command(client, app, {"type": "rotate", "page_ids": [ids[0]], "direction": "left"}).status_code == 200
+    assert post_command(client, app, {"type": "undo"}).status_code == 200
+    assert client.get("/api/session", headers=auth(app)).json()["redo_enabled"] is True
+    assert patch_selection(client, app, [ids[1]], ids[1]).status_code == 200
+
+    response = post_command(
+        client,
+        app,
+        {"type": "reorder", "page_ids": [ids[1]], "before_page_id": ids[2]},
+    )
+
+    assert response.status_code == 200
+    rest, changed, dropped = without_command_flags(response.json())
+    assert changed is False
+    assert dropped is False
+    assert [page["order"] for page in rest["pages"]] == [1, 2, 3]
+    assert rest["undo_enabled"] is False
+    assert rest["redo_enabled"] is True
+    assert client.get("/api/session", headers=auth(app)).json() == rest
+
+
+def test_delete_keeps_other_selection_and_restores_on_undo(env, tmp_path):
+    client, app, session = env
+    source = tmp_path / "sample.pdf"
+    write_pdf(source, pages=6)
+    original = source.read_bytes()
+    loaded = post_file(client, app, source).json()
+    ids = page_ids(loaded)
+    copy_before = next(session.temp_dir.iterdir()).read_bytes()
+    assert patch_selection(client, app, [ids[1], ids[4]], ids[4]).status_code == 200
+
+    response = post_command(client, app, {"type": "delete", "page_ids": [ids[1]]})
+
+    assert response.status_code == 200
+    rest, changed, _dropped = without_command_flags(response.json())
+    assert changed is True
+    assert rest["selected_page_ids"] == [ids[4]]
+    assert rest["active_page_id"] == ids[4]
+    visible = [page for page in rest["pages"] if not page["deleted"]]
+    assert [page["order"] for page in visible] == [1, 2, 3, 4, 5]
+    deleted = next(page for page in rest["pages"] if page["id"] == ids[1])
+    assert deleted["deleted"] is True
+    assert deleted["order"] == 0
+    assert source.read_bytes() == original
+    assert next(session.temp_dir.iterdir()).read_bytes() == copy_before
+
+    undone = post_command(client, app, {"type": "undo"})
+    assert undone.status_code == 200
+    restored, _changed, _dropped = without_command_flags(undone.json())
+    assert [page["deleted"] for page in restored["pages"]] == [False, False, False, False, False, False]
+    assert [page["order"] for page in restored["pages"]] == [1, 2, 3, 4, 5, 6]
+    assert restored["selected_page_ids"] == [ids[1], ids[4]]
+    assert restored["active_page_id"] == ids[4]
+
+
+def test_delete_of_active_page_selects_nearest_remaining_selection(env, tmp_path):
+    client, app, _session = env
+    source = tmp_path / "sample.pdf"
+    write_pdf(source, pages=6)
+    loaded = post_file(client, app, source).json()
+    ids = page_ids(loaded)
+    assert patch_selection(client, app, [ids[1], ids[3], ids[5]], ids[3]).status_code == 200
+
+    removed = post_command(client, app, {"type": "delete", "page_ids": [ids[3]]})
+
+    assert removed.status_code == 200
+    body, _changed, _dropped = without_command_flags(removed.json())
+    assert body["selected_page_ids"] == [ids[1], ids[5]]
+    assert body["active_page_id"] == ids[5]
+
+    assert post_command(client, app, {"type": "undo"}).status_code == 200
+    assert patch_selection(client, app, [ids[1], ids[3], ids[5]], ids[5]).status_code == 200
+    tail = post_command(client, app, {"type": "delete", "page_ids": [ids[5]]})
+    tail_body, _changed, _dropped = without_command_flags(tail.json())
+    assert tail_body["selected_page_ids"] == [ids[1], ids[3]]
+    assert tail_body["active_page_id"] == ids[3]
+
+
+def test_delete_of_whole_selection_selects_page_that_arrives(env, tmp_path):
+    client, app, _session = env
+    source = tmp_path / "sample.pdf"
+    write_pdf(source, pages=5)
+    loaded = post_file(client, app, source).json()
+    ids = page_ids(loaded)
+    assert patch_selection(client, app, [ids[1], ids[2]], ids[2]).status_code == 200
+
+    response = post_command(client, app, {"type": "delete", "page_ids": [ids[1], ids[2]]})
+
+    assert response.status_code == 200
+    body, _changed, _dropped = without_command_flags(response.json())
+    assert body["selected_page_ids"] == [ids[3]]
+    assert body["active_page_id"] == ids[3]
+    assert post_command(client, app, {"type": "undo"}).status_code == 200
+
+    assert patch_selection(client, app, [ids[3], ids[4]], ids[4]).status_code == 200
+    tail = post_command(client, app, {"type": "delete", "page_ids": [ids[3], ids[4]]})
+    tail_body, _changed, _dropped = without_command_flags(tail.json())
+    assert tail_body["selected_page_ids"] == [ids[2]]
+    assert tail_body["active_page_id"] == ids[2]
+
+    assert post_command(client, app, {"type": "undo"}).status_code == 200
+    everything = post_command(client, app, {"type": "delete", "page_ids": ids})
+    empty, _changed, _dropped = without_command_flags(everything.json())
+    assert empty["selected_page_ids"] == []
+    assert empty["active_page_id"] is None
+    assert all(page["deleted"] is True and page["order"] == 0 for page in empty["pages"])
+
+
+def test_deleted_page_cannot_be_rotated_or_reordered(env, tmp_path):
+    client, app, _session = env
+    source = tmp_path / "sample.pdf"
+    write_pdf(source, pages=3)
+    loaded = post_file(client, app, source).json()
+    ids = page_ids(loaded)
+    assert post_command(client, app, {"type": "delete", "page_ids": [ids[1]]}).status_code == 200
+    before = client.get("/api/session", headers=auth(app)).json()
+
+    rotate = post_command(client, app, {"type": "rotate", "page_ids": [ids[1]], "direction": "left"})
+    reorder = post_command(client, app, {"type": "reorder", "page_ids": [ids[0]], "before_page_id": ids[1]})
+
+    assert rotate.status_code == 400
+    assert reorder.status_code == 400
+    assert client.get("/api/session", headers=auth(app)).json() == before
+
+
+def test_unselected_reorder_selects_that_page_and_undo_restores_selection(env, tmp_path):
+    client, app, _session = env
+    source = tmp_path / "sample.pdf"
+    write_pdf(source, pages=5)
+    loaded = post_file(client, app, source).json()
+    ids = page_ids(loaded)
+
+    response = post_command(client, app, {"type": "reorder", "page_ids": [ids[2]], "after_page_id": ids[4]})
+
+    assert response.status_code == 200
+    body, changed, dropped = without_command_flags(response.json())
+    assert changed is True and dropped is False
+    visible = sorted((page for page in body["pages"] if not page["deleted"]), key=lambda page: page["order"])
+    assert [page["source_page"] for page in visible] == [1, 2, 4, 5, 3]
+    assert [page["order"] for page in visible] == [1, 2, 3, 4, 5]
+    assert body["selected_page_ids"] == [ids[2]]
+    assert body["active_page_id"] == ids[2]
+
+    undone = post_command(client, app, {"type": "undo"})
+    restored, _changed, _dropped = without_command_flags(undone.json())
+    restored_visible = sorted(restored["pages"], key=lambda page: page["order"])
+    assert [page["source_page"] for page in restored_visible] == [1, 2, 3, 4, 5]
+    assert [page["order"] for page in restored_visible] == [1, 2, 3, 4, 5]
+    assert restored["selected_page_ids"] == [ids[0]]
+    assert restored["active_page_id"] == ids[0]
+    assert restored["undo_hint"] == "元に戻せる操作がありません。実行しても状態は変わりません"
+
+
+def test_selection_reorder_keeps_order_and_one_undo(env, tmp_path):
+    client, app, _session = env
+    source = tmp_path / "sample.pdf"
+    write_pdf(source, pages=5)
+    loaded = post_file(client, app, source).json()
+    ids = page_ids(loaded)
+    assert patch_selection(client, app, [ids[1], ids[3]], ids[3]).status_code == 200
+
+    response = post_command(
+        client,
+        app,
+        {"type": "reorder", "page_ids": [ids[3], ids[1]], "after_page_id": ids[4]},
+    )
+
+    assert response.status_code == 200
+    body, _changed, _dropped = without_command_flags(response.json())
+    visible = sorted(body["pages"], key=lambda page: page["order"])
+    assert [page["source_page"] for page in visible] == [1, 3, 5, 2, 4]
+    assert body["selected_page_ids"] == [ids[1], ids[3]]
+    assert body["active_page_id"] == ids[3]
+    undone = post_command(client, app, {"type": "undo"})
+    restored, _changed, _dropped = without_command_flags(undone.json())
+    restored_visible = sorted(restored["pages"], key=lambda page: page["order"])
+    assert [page["source_page"] for page in restored_visible] == [1, 2, 3, 4, 5]
+    assert restored["selected_page_ids"] == [ids[1], ids[3]]
+    assert restored["active_page_id"] == ids[3]
+    assert post_command(client, app, {"type": "undo"}).status_code == 400
+
+
+def test_new_edit_after_undo_discards_redo(env, tmp_path):
+    client, app, _session = env
+    source = tmp_path / "sample.pdf"
+    write_pdf(source, pages=1)
+    loaded = post_file(client, app, source).json()
+    page_id = loaded["pages"][0]["id"]
+    assert post_command(client, app, {"type": "rotate", "page_ids": [page_id], "direction": "right"}).status_code == 200
+    assert post_command(client, app, {"type": "undo"}).status_code == 200
+    assert client.get("/api/session", headers=auth(app)).json()["redo_enabled"] is True
+
+    assert post_command(client, app, {"type": "rotate", "page_ids": [page_id], "direction": "left"}).status_code == 200
+
+    current = client.get("/api/session", headers=auth(app)).json()
+    assert current["pages"][0]["rotation"] == 270
+    assert current["redo_enabled"] is False
+    assert post_command(client, app, {"type": "redo"}).status_code == 400
+    assert client.get("/api/session", headers=auth(app)).json() == current
+
+
+def test_history_drop_is_notified_once_until_replace(env, tmp_path):
+    client, app, session = env
+    source = tmp_path / "sample.pdf"
+    write_pdf(source, pages=1)
+    loaded = post_file(client, app, source).json()
+    page_id = loaded["pages"][0]["id"]
+
+    dropped_flags = []
+    for _ in range(102):
+        response = post_command(client, app, {"type": "rotate", "page_ids": [page_id], "direction": "right"})
+        assert response.status_code == 200
+        dropped_flags.append(response.json()["history_dropped"])
+
+    assert dropped_flags[:100] == [False] * 100
+    assert dropped_flags[100] is True
+    assert dropped_flags[101] is False
+    assert client.get("/api/session", headers=auth(app)).json()["pages"][0]["rotation"] == 180
+    assert len(list(session.temp_dir.iterdir())) == 1
+    for _ in range(100):
+        assert post_command(client, app, {"type": "undo"}).status_code == 200
+    kept = client.get("/api/session", headers=auth(app)).json()
+    assert kept["pages"][0]["rotation"] == 180
+    assert kept["undo_enabled"] is False
+    assert post_command(client, app, {"type": "undo"}).status_code == 400
+
+    replacement = tmp_path / "other.pdf"
+    write_pdf(replacement, pages=1)
+    replaced = post_file(client, app, replacement).json()
+    assert replaced["undo_enabled"] is False
+    assert replaced["redo_enabled"] is False
+    next_id = replaced["pages"][0]["id"]
+    flags = []
+    for _ in range(101):
+        response = post_command(client, app, {"type": "rotate", "page_ids": [next_id], "direction": "right"})
+        flags.append(response.json()["history_dropped"])
+    assert flags[:100] == [False] * 100
+    assert flags[100] is True
+
+
+def test_failed_replace_keeps_history_and_selection(env, tmp_path):
+    client, app, _session = env
+    source = tmp_path / "sample.pdf"
+    write_pdf(source, pages=2)
+    loaded = post_file(client, app, source).json()
+    ids = page_ids(loaded)
+    assert patch_selection(client, app, [ids[1]], ids[1]).status_code == 200
+    assert post_command(client, app, {"type": "rotate", "page_ids": [ids[1]], "direction": "right"}).status_code == 200
+    before = client.get("/api/session", headers=auth(app)).json()
+    broken = tmp_path / "broken.pdf"
+    broken.write_bytes(b"%PDF-1.7\nthis is not a pdf")
+
+    response = post_file(client, app, broken)
+
+    assert response.status_code == 400
+    assert client.get("/api/session", headers=auth(app)).json() == before
+
+
+def test_selection_patch_does_not_add_history(env, tmp_path):
+    client, app, _session = env
+    source = tmp_path / "sample.pdf"
+    write_pdf(source, pages=3)
+    loaded = post_file(client, app, source).json()
+    ids = page_ids(loaded)
+
+    assert patch_selection(client, app, [ids[1]], ids[1]).status_code == 200
+    assert client.get("/api/session", headers=auth(app)).json()["undo_enabled"] is False
+    assert post_command(client, app, {"type": "rotate", "page_ids": [ids[1]], "direction": "right"}).status_code == 200
+    assert patch_selection(client, app, [ids[2]], ids[2]).status_code == 200
+    current = client.get("/api/session", headers=auth(app)).json()
+    assert current["undo_enabled"] is True
+    assert current["selected_page_ids"] == [ids[2]]
+
+    undone = post_command(client, app, {"type": "undo"})
+    body, _changed, _dropped = without_command_flags(undone.json())
+    assert body["pages"][1]["rotation"] == 0
+    assert body["selected_page_ids"] == [ids[1]]
+    assert body["active_page_id"] == ids[1]
+    assert post_command(client, app, {"type": "undo"}).status_code == 400
+
+
+def test_commands_require_token(env, tmp_path):
+    client, app, _session = env
+    source = tmp_path / "sample.pdf"
+    write_pdf(source, pages=1)
+    assert post_file(client, app, source).status_code == 200
+
+    response = post_command(client, app, {"type": "undo"}, headers={})
 
     assert response.status_code == 401

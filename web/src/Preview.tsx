@@ -1,6 +1,7 @@
-import { useEffect, useLayoutEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { Fragment, useEffect, useLayoutEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import type { PDFDocumentProxy } from "pdfjs-dist";
-import { isCancelledRender, paintThumbnail, startPageBitmap } from "./pdf";
+import { isCancelledRender, paintThumbnail, ratiosAfterClockwise, startPageBitmap } from "./pdf";
+import { insertionSlot, reorderAnchor, type ReorderAnchor } from "./reorder";
 import type { PageRecord, ThumbnailLayout } from "./types";
 import type { ZoomMetrics, ZoomState } from "./zoom";
 import { effectivePercent } from "./zoom";
@@ -32,7 +33,7 @@ export function ZoomPreview({
 }) {
   const viewportRef = useRef<HTMLDivElement>(null);
   const slotRef = useRef<HTMLDivElement>(null);
-  const cacheRef = useRef<Map<string, { scale: number; canvas: HTMLCanvasElement }>>(new Map());
+  const cacheRef = useRef<Map<string, { scale: number; rotation: number; canvas: HTMLCanvasElement }>>(new Map());
   const ratios = useRef({ x: 0, y: 0 });
   const restoring = useRef(false);
   const pdfRef = useRef(pdf);
@@ -65,8 +66,9 @@ export function ZoomPreview({
     const sourcePage = active.source_page;
     let cancelled = false;
     setBase(null);
+    const additional = active.rotation;
     void pdf.getPage(sourcePage).then((page) => {
-      const viewport = page.getViewport({ scale: 1 });
+      const viewport = page.getViewport({ scale: 1, rotation: (page.rotate + additional) % 360 });
       if (!cancelled) {
         setBase({ width: viewport.width, height: viewport.height });
       }
@@ -74,7 +76,7 @@ export function ZoomPreview({
     return () => {
       cancelled = true;
     };
-  }, [pdf, activeId, active?.source_page]);
+  }, [pdf, activeId, active?.source_page, active?.rotation]);
 
   const measured = Boolean(base) && view.width > 1 && view.height > 1;
   const fitPage = measured && base ? Math.min(view.width / base.width, view.height / base.height) * 100 : 0;
@@ -84,7 +86,7 @@ export function ZoomPreview({
   pagesRef.current = pages;
   const neighborKey = active
     ? neighborPages(pages, active.id)
-        .map((page) => `${page.id}:${page.source_page}`)
+        .map((page) => `${page.id}:${page.source_page}:${page.rotation}`)
         .join("|")
     : "";
 
@@ -107,7 +109,8 @@ export function ZoomPreview({
     const targets = neighborPages(pagesRef.current, current.id);
     const cache = cacheRef.current;
     for (const [id, entry] of cache) {
-      if (!targets.some((page) => page.id === id) || Math.abs(entry.scale - scale) > 0.0001) {
+      const page = targets.find((item) => item.id === id);
+      if (!page || Math.abs(entry.scale - scale) > 0.0001 || entry.rotation !== page.rotation) {
         cache.delete(id);
       }
     }
@@ -119,7 +122,7 @@ export function ZoomPreview({
         if (cancelled || cache.has(page.id)) {
           continue;
         }
-        const started = await startPageBitmap(pdf, page.source_page, scale);
+        const started = await startPageBitmap(pdf, page.source_page, scale, page.rotation);
         tasks.push(started.task);
         if (cancelled) {
           started.task.cancel();
@@ -136,7 +139,7 @@ export function ZoomPreview({
         if (cancelled) {
           return;
         }
-        cache.set(page.id, { scale, canvas: started.canvas });
+        cache.set(page.id, { scale, rotation: page.rotation, canvas: started.canvas });
         while (cache.size > 3) {
           const extra = [...cache.keys()].find((id) => id !== current.id);
           if (!extra) {
@@ -166,6 +169,19 @@ export function ZoomPreview({
       slot.append(entry.canvas);
     }
   }, [tick, activeId]);
+
+  const rotationWatch = useRef<{ id: string; rotation: number } | null>(null);
+  useLayoutEffect(() => {
+    if (!active) {
+      return;
+    }
+    const previous = rotationWatch.current;
+    if (previous && previous.id === active.id && previous.rotation !== active.rotation) {
+      const quarterTurns = ((active.rotation - previous.rotation + 360) % 360) / 90;
+      ratios.current = ratiosAfterClockwise(ratios.current, quarterTurns);
+    }
+    rotationWatch.current = { id: active.id, rotation: active.rotation };
+  }, [active]);
 
   useLayoutEffect(() => {
     const node = viewportRef.current;
@@ -236,6 +252,25 @@ export function ZoomPreview({
   );
 }
 
+const DRAG_START_PX = 8;
+const AUTO_SCROLL_PX_PER_SECOND = 480;
+const AUTO_SCROLL_EDGE_PX = 48;
+
+let cancelActiveDrag: () => boolean = () => false;
+
+export function cancelThumbnailDrag(): boolean {
+  return cancelActiveDrag();
+}
+
+type ThumbDrag = {
+  pointerId: number;
+  pageId: string;
+  startX: number;
+  startY: number;
+  active: boolean;
+  slot: number;
+};
+
 export function ThumbnailStrip({
   pdf,
   pages,
@@ -244,7 +279,11 @@ export function ThumbnailStrip({
   activeId,
   layout,
   frameHeight,
-  onActivate,
+  onSelect,
+  onRotate,
+  onDelete,
+  onReorder,
+  onUnchangedReorder,
   onBlank,
   onColumns,
 }: {
@@ -255,12 +294,25 @@ export function ThumbnailStrip({
   activeId: string | null;
   layout: ThumbnailLayout;
   frameHeight: number;
-  onActivate: (pageId: string, mode: "single" | "toggle" | "range") => void;
+  onSelect: (pageId: string, mode: "single" | "toggle" | "range") => void;
+  onRotate: (pageId: string, direction: "left" | "right") => void;
+  onDelete: (pageId: string) => void;
+  onReorder: (pageIds: string[], anchor: ReorderAnchor) => void;
+  onUnchangedReorder: () => void;
   onBlank: () => void;
   onColumns: (count: number) => void;
 }) {
   const rootRef = useRef<HTMLDivElement>(null);
   const [root, setRoot] = useState<HTMLDivElement | null>(null);
+  const [dragging, setDragging] = useState(false);
+  const [dragSlot, setDragSlot] = useState<number | null>(null);
+  const dragRef = useRef<ThumbDrag | null>(null);
+  const pointRef = useRef({ x: 0, y: 0 });
+  const suppressClick = useRef(false);
+  const pagesRef = useRef(pages);
+  const selectedRef = useRef(selectedIds);
+  pagesRef.current = pages;
+  selectedRef.current = selectedIds;
 
   useEffect(() => {
     setRoot(rootRef.current);
@@ -307,6 +359,115 @@ export function ThumbnailStrip({
     return () => observer.disconnect();
   }, [layout, frameHeight, pages, onColumns]);
 
+  useEffect(() => {
+    cancelActiveDrag = () => {
+      if (!dragRef.current?.active) {
+        return false;
+      }
+      dragRef.current = null;
+      suppressClick.current = true;
+      setDragging(false);
+      setDragSlot(null);
+      return true;
+    };
+    return () => {
+      cancelActiveDrag = () => false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!dragging) {
+      return;
+    }
+    let frame = 0;
+    let last = performance.now();
+    const tick = (now: number) => {
+      const dt = Math.min(0.05, (now - last) / 1000);
+      last = now;
+      const node = rootRef.current;
+      if (node) {
+        const rect = node.getBoundingClientRect();
+        const point = pointRef.current;
+        const speed = AUTO_SCROLL_PX_PER_SECOND * dt;
+        if (layout === "row") {
+          if (point.x < rect.left + AUTO_SCROLL_EDGE_PX) {
+            node.scrollLeft -= speed;
+          } else if (point.x > rect.right - AUTO_SCROLL_EDGE_PX) {
+            node.scrollLeft += speed;
+          }
+        } else if (point.y < rect.top + AUTO_SCROLL_EDGE_PX) {
+          node.scrollTop -= speed;
+        } else if (point.y > rect.bottom - AUTO_SCROLL_EDGE_PX) {
+          node.scrollTop += speed;
+        }
+      }
+      frame = requestAnimationFrame(tick);
+    };
+    frame = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(frame);
+  }, [dragging, layout]);
+
+  function thumbElements(): HTMLElement[] {
+    return [...(rootRef.current?.querySelectorAll<HTMLElement>(".thumb") ?? [])];
+  }
+
+  function onThumbPointerDown(event: ReactPointerEvent<HTMLButtonElement>, pageId: string) {
+    if (event.button !== 0) {
+      return;
+    }
+    dragRef.current = {
+      pointerId: event.pointerId,
+      pageId,
+      startX: event.clientX,
+      startY: event.clientY,
+      active: false,
+      slot: 0,
+    };
+    pointRef.current = { x: event.clientX, y: event.clientY };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }
+
+  function onThumbPointerMove(event: ReactPointerEvent<HTMLButtonElement>) {
+    const drag = dragRef.current;
+    if (!drag || event.pointerId !== drag.pointerId) {
+      return;
+    }
+    pointRef.current = { x: event.clientX, y: event.clientY };
+    const distance = Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY);
+    if (!drag.active && distance < DRAG_START_PX) {
+      return;
+    }
+    if (!drag.active) {
+      drag.active = true;
+      setDragging(true);
+    }
+    const next = insertionSlot(thumbElements(), pointRef.current);
+    drag.slot = next;
+    setDragSlot(next);
+  }
+
+  function onThumbPointerUp(event: ReactPointerEvent<HTMLButtonElement>) {
+    const drag = dragRef.current;
+    if (!drag || event.pointerId !== drag.pointerId) {
+      return;
+    }
+    dragRef.current = null;
+    if (!drag.active) {
+      return;
+    }
+    suppressClick.current = true;
+    setDragging(false);
+    setDragSlot(null);
+    const ordered = pagesRef.current.map((page) => page.id);
+    const moving = selectedRef.current.includes(drag.pageId) ? selectedRef.current : [drag.pageId];
+    const anchor = reorderAnchor(ordered, moving, drag.slot);
+    if (anchor === "same") {
+      onUnchangedReorder();
+      return;
+    }
+    onReorder(moving, anchor);
+  }
+
   return (
     <div
       className={layout === "grid" ? "thumbs grid" : "thumbs row"}
@@ -318,19 +479,34 @@ export function ThumbnailStrip({
         }
       }}
     >
-      {pages.map((page) => (
-        <Thumbnail
-          key={page.id}
-          pdf={pdf}
-          page={page}
-          filename={names.get(page.document_id) ?? ""}
-          selected={selectedIds.includes(page.id)}
-          current={page.id === activeId}
-          frameHeight={frameHeight}
-          root={root}
-          onActivate={onActivate}
-        />
+      {pages.map((page, index) => (
+        <Fragment key={page.id}>
+          {dragSlot === index ? <span className="drop-line" /> : null}
+          <Thumbnail
+            pdf={pdf}
+            page={page}
+            filename={names.get(page.document_id) ?? ""}
+            selected={selectedIds.includes(page.id)}
+            active={page.id === activeId}
+            frameHeight={frameHeight}
+            root={root}
+            onSelect={onSelect}
+            onRotate={onRotate}
+            onDelete={onDelete}
+            onPointerDown={onThumbPointerDown}
+            onPointerMove={onThumbPointerMove}
+            onPointerUp={onThumbPointerUp}
+            consumeSuppressedClick={() => {
+              if (!suppressClick.current) {
+                return false;
+              }
+              suppressClick.current = false;
+              return true;
+            }}
+          />
+        </Fragment>
       ))}
+      {dragSlot === pages.length ? <span className="drop-line" /> : null}
     </div>
   );
 }
@@ -340,28 +516,43 @@ function Thumbnail({
   page,
   filename,
   selected,
-  current,
+  active,
   frameHeight,
   root,
-  onActivate,
+  onSelect,
+  onRotate,
+  onDelete,
+  onPointerDown,
+  onPointerMove,
+  onPointerUp,
+  consumeSuppressedClick,
 }: {
   pdf: PDFDocumentProxy;
   page: PageRecord;
   filename: string;
   selected: boolean;
-  current: boolean;
+  active: boolean;
   frameHeight: number;
   root: HTMLDivElement | null;
-  onActivate: (pageId: string, mode: "single" | "toggle" | "range") => void;
+  onSelect: (pageId: string, mode: "single" | "toggle" | "range") => void;
+  onRotate: (pageId: string, direction: "left" | "right") => void;
+  onDelete: (pageId: string) => void;
+  onPointerDown: (event: ReactPointerEvent<HTMLButtonElement>, pageId: string) => void;
+  onPointerMove: (event: ReactPointerEvent<HTMLButtonElement>) => void;
+  onPointerUp: (event: ReactPointerEvent<HTMLButtonElement>) => void;
+  consumeSuppressedClick: () => boolean;
 }) {
-  const itemRef = useRef<HTMLButtonElement>(null);
+  const itemRef = useRef<HTMLDivElement>(null);
   const [shown, setShown] = useState(false);
   const [ratio, setRatio] = useState(0.75);
 
   useEffect(() => {
     let cancelled = false;
     void pdf.getPage(page.source_page).then((pdfPage) => {
-      const viewport = pdfPage.getViewport({ scale: 1 });
+      const viewport = pdfPage.getViewport({
+        scale: 1,
+        rotation: (pdfPage.rotate + page.rotation) % 360,
+      });
       if (!cancelled && viewport.height > 0) {
         setRatio(viewport.width / viewport.height);
       }
@@ -369,7 +560,7 @@ function Thumbnail({
     return () => {
       cancelled = true;
     };
-  }, [pdf, page.source_page]);
+  }, [pdf, page.source_page, page.rotation]);
 
   useEffect(() => {
     const node = itemRef.current;
@@ -387,54 +578,81 @@ function Thumbnail({
   }, [root]);
 
   const width = Math.max(1, Math.round(frameHeight * ratio));
-  const className = ["thumb", selected ? "selected" : "", current ? "current" : ""].filter(Boolean).join(" ");
+  const className = ["thumb", selected ? "selected" : "", active ? "active" : ""].filter(Boolean).join(" ");
 
   return (
-    <button
-      ref={itemRef}
-      type="button"
-      className={className}
-      style={{ width }}
-      aria-pressed={selected}
-      aria-current={current ? "true" : undefined}
-      onContextMenu={(event) => event.preventDefault()}
-      onClick={(event) => {
-        if (event.shiftKey) {
-          onActivate(page.id, "range");
-          return;
-        }
-        if (event.ctrlKey) {
-          onActivate(page.id, "toggle");
-          return;
-        }
-        onActivate(page.id, "single");
-      }}
-    >
-      <span className="thumb-frame" style={{ width, height: frameHeight }}>
-        {shown ? <ThumbnailCanvas pdf={pdf} sourcePage={page.source_page} width={width} height={frameHeight} /> : null}
-      </span>
-      {selected ? (
-        <span className="thumb-check" aria-hidden="true">
-          ✓
+    <div ref={itemRef} className={className} style={{ width }}>
+      <button
+        type="button"
+        className="thumb-main"
+        aria-pressed={selected}
+        aria-current={active ? "true" : undefined}
+        onContextMenu={(event) => event.preventDefault()}
+        onPointerDown={(event) => onPointerDown(event, page.id)}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+        onClick={(event) => {
+          if (consumeSuppressedClick()) {
+            return;
+          }
+          if (event.shiftKey) {
+            onSelect(page.id, "range");
+            return;
+          }
+          if (event.ctrlKey) {
+            onSelect(page.id, "toggle");
+            return;
+          }
+          onSelect(page.id, "single");
+        }}
+      >
+        <span className="thumb-frame" style={{ width, height: frameHeight }}>
+          {shown ? (
+            <ThumbnailCanvas
+              pdf={pdf}
+              sourcePage={page.source_page}
+              additionalRotation={page.rotation}
+              width={width}
+              height={frameHeight}
+            />
+          ) : null}
         </span>
-      ) : null}
-      <span>現在ページ番号 {page.order}</span>
-      <span className="thumb-name" title={filename}>
-        元 PDF 名 {filename}
+        {selected ? (
+          <span className="thumb-check" aria-hidden="true">
+            ✓
+          </span>
+        ) : null}
+        <span>現在ページ番号 {page.order}</span>
+        <span className="thumb-name" title={filename}>
+          元 PDF 名 {filename}
+        </span>
+        <span>元ページ番号 {page.source_page}</span>
+      </button>
+      <span className="thumb-actions">
+        <button type="button" aria-label="左に回転" onClick={() => onRotate(page.id, "left")}>
+          左
+        </button>
+        <button type="button" aria-label="右に回転" onClick={() => onRotate(page.id, "right")}>
+          右
+        </button>
+        <button type="button" aria-label="このページを削除" onClick={() => onDelete(page.id)}>
+          削除
+        </button>
       </span>
-      <span>元ページ番号 {page.source_page}</span>
-    </button>
+    </div>
   );
 }
 
 function ThumbnailCanvas({
   pdf,
   sourcePage,
+  additionalRotation,
   width,
   height,
 }: {
   pdf: PDFDocumentProxy;
   sourcePage: number;
+  additionalRotation: number;
   width: number;
   height: number;
 }) {
@@ -447,7 +665,7 @@ function ThumbnailCanvas({
     }
     let cancelled = false;
     let task: { cancel: () => void } | null = null;
-    void paintThumbnail(pdf, sourcePage, canvas, width, height)
+    void paintThumbnail(pdf, sourcePage, canvas, width, height, additionalRotation)
       .then((renderTask) => {
         task = renderTask;
         return renderTask.promise;
@@ -461,7 +679,7 @@ function ThumbnailCanvas({
       cancelled = true;
       task?.cancel();
     };
-  }, [pdf, sourcePage, width, height]);
+  }, [pdf, sourcePage, additionalRotation, width, height]);
 
   return <canvas ref={canvasRef} />;
 }

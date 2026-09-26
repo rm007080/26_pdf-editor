@@ -307,6 +307,55 @@ def test_inflight_load_does_not_replace_session_during_export(env, tmp_path):
     assert {path.name: path.read_bytes() for path in session.temp_dir.iterdir()} == copies
 
 
+def test_export_adds_session_rotation_without_changing_source(env, tmp_path):
+    client, app, session = env
+    source = tmp_path / "sample.pdf"
+    pdf = pikepdf.Pdf.new()
+    pdf.add_blank_page(page_size=(72, 144))
+    pdf.pages[0].rotate(90, relative=False)
+    pdf.add_blank_page(page_size=(72, 72))
+    pdf.save(source)
+    original = source.read_bytes()
+    loaded = post_file(client, app, source).json()
+    ids = [page["id"] for page in loaded["pages"]]
+    command = client.post(
+        "/api/session/commands",
+        headers=auth(app),
+        json={"type": "rotate", "page_ids": ids, "direction": "right"},
+    )
+    assert command.status_code == 200
+    destination = tmp_path / "out"
+    destination.mkdir()
+    app.state.exporter.ask_save_path = lambda _directory, _name: destination / "out.pdf"
+
+    response = post_export(client, app)
+    job = wait_job(client, app, response.json()["job_id"])
+
+    assert job["stage"] == "completed"
+    with pikepdf.open(job["path"]) as exported:
+        assert [page.rotation for page in exported.pages] == [180, 90]
+    with pikepdf.open(next(session.temp_dir.iterdir())) as stored:
+        assert [page.rotation for page in stored.pages] == [90, 0]
+    assert source.read_bytes() == original
+
+
+def test_export_rejected_when_no_visible_pages(env, tmp_path):
+    client, app, _session = env
+    source = tmp_path / "sample.pdf"
+    write_pdf(source, pages=1)
+    loaded = post_file(client, app, source).json()
+    deleted = client.post(
+        "/api/session/commands",
+        headers=auth(app),
+        json={"type": "delete", "page_ids": [loaded["pages"][0]["id"]]},
+    )
+    assert deleted.status_code == 200
+
+    response = post_export(client, app)
+
+    assert response.status_code == 400
+
+
 def test_open_actions_work_only_after_success(env, tmp_path):
     client, app, _session = env
     source = tmp_path / "sample.pdf"

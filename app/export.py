@@ -17,13 +17,13 @@ class ExportFailure(Exception):
 
 
 class Job:
-    def __init__(self, job_id: str, requested: Path, source_pages: list[int]) -> None:
+    def __init__(self, job_id: str, requested: Path, page_plan: list[tuple[int, int]]) -> None:
         self.id = job_id
         self.requested = requested
-        self.source_pages = source_pages
+        self.page_plan = page_plan
         self.stage = "copying"
         self.processed_pages = 0
-        self.total_pages = len(source_pages)
+        self.total_pages = len(page_plan)
         self.path: Path | None = None
         self.detail: str | None = None
 
@@ -126,25 +126,26 @@ class ExportService:
         finally:
             self.session.finish(Activity.EXPORTING)
 
-    def _plan(self) -> tuple[Path, str, list[int]] | None:
+    def _plan(self) -> tuple[Path, str, list[tuple[int, int]]] | None:
         snapshot = self.session.snapshot()
         pages = [page for page in snapshot["pages"] if not page["deleted"]]
         pages.sort(key=lambda page: page["order"])
         if not snapshot["documents"] or not pages:
             return None
         filename = initial_filename(snapshot["documents"][0]["filename"])
-        return documents_folder(), filename, [int(page["source_page"]) for page in pages]
+        page_plan = [(int(page["source_page"]), int(page["rotation"])) for page in pages]
+        return documents_folder(), filename, page_plan
 
-    def _create_job(self, requested: Path, pages: list[int]) -> str:
+    def _create_job(self, requested: Path, pages: list[tuple[int, int]]) -> str:
         job_id = uuid4().hex
         with self._lock:
             self._jobs[job_id] = Job(job_id, requested, pages)
         return job_id
 
-    def _job_plan(self, job_id: str) -> tuple[Path, int, list[int]]:
+    def _job_plan(self, job_id: str) -> tuple[Path, int, list[tuple[int, int]]]:
         with self._lock:
             job = self._jobs[job_id]
-            return job.requested, job.total_pages, list(job.source_pages)
+            return job.requested, job.total_pages, list(job.page_plan)
 
     def _update(self, job_id: str, **changes) -> None:
         with self._lock:
@@ -152,13 +153,15 @@ class ExportService:
             for key, value in changes.items():
                 setattr(job, key, value)
 
-    def _copy_pages(self, source: Path, temp_path: Path, pages: list[int], job_id: str) -> None:
+    def _copy_pages(self, source: Path, temp_path: Path, pages: list[tuple[int, int]], job_id: str) -> None:
         with pikepdf.open(source) as src:
             if self.pause_during_copy is not None:
                 self.pause_during_copy()
             output = pikepdf.Pdf.new()
-            for index, source_page in enumerate(pages, start=1):
+            for index, (source_page, rotation) in enumerate(pages, start=1):
                 output.pages.append(src.pages[source_page - 1])
+                if rotation % 360:
+                    output.pages[-1].rotate(rotation % 360, relative=True)
                 self._update(job_id, processed_pages=index)
             output.save(temp_path)
 

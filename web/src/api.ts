@@ -1,4 +1,4 @@
-import type { ExportJob, ExportStart, SessionState, ViewSettings } from "./types";
+import type { CommandResult, EditCommand, ExportJob, ExportStart, SessionState, ViewSettings } from "./types";
 
 export class ApiError extends Error {
   readonly status: number;
@@ -42,6 +42,14 @@ export function putSettings(token: string, settings: ViewSettings): Promise<View
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(settings),
   }).then((response) => readJson<ViewSettings>(response));
+}
+
+export function postCommand(token: string, command: EditCommand): Promise<CommandResult> {
+  return request(token, "/api/session/commands", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(command),
+  }).then((response) => readJson<CommandResult>(response));
 }
 
 export function patchSelection(

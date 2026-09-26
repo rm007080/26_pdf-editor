@@ -7,6 +7,7 @@ import {
   getSettings,
   openSaved,
   patchSelection,
+  postCommand,
   postDocument,
   postExport,
   putSettings,
@@ -14,7 +15,7 @@ import {
 } from "./api";
 import { FRAME_HEIGHT, SPLITTER, oneRowHeight, paneHeights, ratioFromThumb } from "./panes";
 import { openSessionPdf } from "./pdf";
-import { ThumbnailStrip, ZoomPreview, visiblePages } from "./Preview";
+import { ThumbnailStrip, ZoomPreview, cancelThumbnailDrag, visiblePages } from "./Preview";
 import {
   clearSelection,
   ctrlClick,
@@ -26,7 +27,8 @@ import {
   singleSelection,
   type PageSelection,
 } from "./selection";
-import type { ExportJob, SessionState, ThumbnailLayout, ThumbnailSize, ViewSettings } from "./types";
+import type { EditCommand, ExportJob, SessionState, ThumbnailLayout, ThumbnailSize, ViewSettings } from "./types";
+import type { ReorderAnchor } from "./reorder";
 import { changeZoom, formatPercent, initialZoom, zoomUnchanged, type NamedZoom, type ZoomMetrics, type ZoomState } from "./zoom";
 
 const stageLabel: Record<ExportJob["stage"], string> = {
@@ -42,6 +44,10 @@ const emptySession: SessionState = {
   pages: [],
   selected_page_ids: [],
   active_page_id: null,
+  undo_enabled: false,
+  redo_enabled: false,
+  undo_hint: "元に戻せる操作がありません。実行しても状態は変わりません",
+  redo_hint: "やり直せる操作がありません。実行しても状態は変わりません",
 };
 
 const defaultSettings: ViewSettings = {
@@ -77,17 +83,19 @@ function TipButton({
   label,
   disabled,
   reason,
+  title,
   pressed,
   onClick,
 }: {
   label: string;
   disabled?: boolean;
   reason?: string;
+  title?: string;
   pressed?: boolean;
   onClick: () => void;
 }) {
   return (
-    <span className="tip" title={disabled ? reason : undefined}>
+    <span className="tip" title={title ?? (disabled ? reason : undefined)}>
       <button type="button" disabled={disabled} aria-pressed={pressed} onClick={onClick}>
         {label}
       </button>
@@ -107,6 +115,9 @@ export function App() {
   const [saved, setSaved] = useState<{ jobId: string; path: string } | null>(null);
   const [busy, setBusy] = useState(false);
   const [jumpText, setJumpText] = useState("");
+  const [moveText, setMoveText] = useState("");
+  const [toast, setToast] = useState<string | null>(null);
+  const [removedCount, setRemovedCount] = useState<number | null>(null);
   const [zoom, setZoom] = useState<ZoomState>(initialZoom);
   const [metrics, setMetrics] = useState<ZoomMetrics | null>(null);
   const [workspaceHeight, setWorkspaceHeight] = useState(0);
@@ -121,11 +132,14 @@ export function App() {
   const sessionRef = useRef(session);
   const settingsRef = useRef(settings);
   const columnsRef = useRef(columns);
+  const busyRef = useRef(busy);
+  const toastTimer = useRef(0);
   zoomRef.current = zoom;
   metricsRef.current = metrics;
   sessionRef.current = session;
   settingsRef.current = settings;
   columnsRef.current = columns;
+  busyRef.current = busy;
 
   const pages = visiblePages(session.pages);
   const names = useMemo(
@@ -219,24 +233,62 @@ export function App() {
     };
   }, [token, documentId]);
 
+  function publishSession(updated: SessionState, ticket: number, keepAnchor = false): boolean {
+    if (ticket !== ticketRef.current) {
+      return false;
+    }
+    setSession(updated);
+    if (!keepAnchor) {
+      anchorRef.current = updated.active_page_id;
+    }
+    return true;
+  }
+
+  function showToast(message: string) {
+    setToast(message);
+    window.clearTimeout(toastTimer.current);
+    toastTimer.current = window.setTimeout(() => setToast(null), 4000);
+  }
+
   async function applySelection(next: PageSelection, keepAnchor = false): Promise<boolean> {
     const ticket = ++ticketRef.current;
     try {
       const updated = await patchSelection(token, next.selected_page_ids, next.active_page_id);
-      if (ticket !== ticketRef.current) {
-        return false;
-      }
-      setSession(updated);
-      if (!keepAnchor) {
-        anchorRef.current = updated.active_page_id;
-      }
-      return true;
+      return publishSession(updated, ticket, keepAnchor);
     } catch (reason: unknown) {
       if (reason instanceof ApiError && (reason.status === 400 || reason.status === 409)) {
         return false;
       }
       setError(reason instanceof Error ? reason.message : "選択を更新できませんでした");
       return false;
+    }
+  }
+
+  async function runCommand(command: EditCommand) {
+    if (busyRef.current) {
+      return;
+    }
+    setRemovedCount(null);
+    const ticket = ++ticketRef.current;
+    try {
+      const result = await postCommand(token, command);
+      if (!publishSession(result, ticket)) {
+        return;
+      }
+      if (result.history_dropped) {
+        showToast("古い操作履歴を破棄しました");
+      }
+      if (command.type === "reorder" && !result.changed) {
+        showToast("並びは変わっていません");
+      }
+      if (command.type === "delete" && result.changed) {
+        setRemovedCount(command.page_ids.length);
+      }
+    } catch (reason: unknown) {
+      if (ticket !== ticketRef.current) {
+        return;
+      }
+      setError(reason instanceof Error ? reason.message : "編集できませんでした");
     }
   }
 
@@ -278,11 +330,37 @@ export function App() {
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if (isTextField(event.target)) {
+      if (isTextField(event.target) || busyRef.current) {
+        return;
+      }
+      if (event.ctrlKey && !event.altKey && event.key.toLowerCase() === "z") {
+        event.preventDefault();
+        if (sessionRef.current.undo_enabled) {
+          void runCommand({ type: "undo" });
+        }
+        return;
+      }
+      if (event.ctrlKey && !event.altKey && event.key.toLowerCase() === "y") {
+        event.preventDefault();
+        if (sessionRef.current.redo_enabled) {
+          void runCommand({ type: "redo" });
+        }
+        return;
+      }
+      if (event.key === "Delete") {
+        const selected = sessionRef.current.selected_page_ids;
+        if (selected.length === 0) {
+          return;
+        }
+        event.preventDefault();
+        void runCommand({ type: "delete", page_ids: selected });
         return;
       }
       if (event.key === "Escape") {
         event.preventDefault();
+        if (cancelThumbnailDrag()) {
+          return;
+        }
         void applySelection(clearSelection());
         return;
       }
@@ -352,9 +430,9 @@ export function App() {
     setSaved(null);
     setProgress(null);
     try {
+      const ticket = ++ticketRef.current;
       const next = await postDocument(token, file);
-      setSession(next);
-      anchorRef.current = next.active_page_id;
+      publishSession(next, ticket);
     } catch (reason: unknown) {
       setError(reason instanceof Error ? reason.message : "読み込めませんでした");
     }
@@ -406,7 +484,7 @@ export function App() {
     }
   }
 
-  function activate(pageId: string, mode: "single" | "toggle" | "range") {
+  function selectByPointer(pageId: string, mode: "single" | "toggle" | "range") {
     const current = sessionRef.current;
     const visible = visiblePages(current.pages);
     if (mode === "toggle") {
@@ -503,8 +581,50 @@ export function App() {
       ? "400%より大きくできないため使えません。400%より小さい表示のときに使えます。"
       : undefined;
 
+  const editLocked = busy ? "書き出し中は編集できません。" : undefined;
+  const selectionReason = editLocked ?? (session.selected_page_ids.length === 0 ? noPageReason : undefined);
   const emptyMessage =
-    pages.length === 0 ? "PDF を選ぶと、1 ページ目がここに表示されます。" : active ? null : selectPrompt;
+    pages.length === 0
+      ? session.documents.length === 0
+        ? "PDF を選ぶと、1 ページ目がここに表示されます。"
+        : "見えているページはありません。"
+      : active
+        ? null
+        : selectPrompt;
+
+  function rotateSelection(direction: "left" | "right") {
+    const ids = sessionRef.current.selected_page_ids;
+    if (ids.length === 0) {
+      return;
+    }
+    void runCommand({ type: "rotate", page_ids: ids, direction });
+  }
+
+  function deleteSelection() {
+    const ids = sessionRef.current.selected_page_ids;
+    if (ids.length === 0) {
+      return;
+    }
+    void runCommand({ type: "delete", page_ids: ids });
+  }
+
+  function moveSelection(place: "before" | "after") {
+    const current = sessionRef.current;
+    if (current.selected_page_ids.length === 0) {
+      return;
+    }
+    const target = visiblePages(current.pages).find((page) => page.order === Number(moveText));
+    if (!target) {
+      setError("その現在ページ番号はありません");
+      return;
+    }
+    const anchor = place === "before" ? { before_page_id: target.id } : { after_page_id: target.id };
+    void runCommand({ type: "reorder", page_ids: current.selected_page_ids, ...anchor });
+  }
+
+  function reorderPages(pageIds: string[], anchor: ReorderAnchor) {
+    void runCommand({ type: "reorder", page_ids: pageIds, ...anchor });
+  }
 
   return (
     <div className="app">
@@ -522,6 +642,56 @@ export function App() {
             }}
           />
         </label>
+        <TipButton
+          label="元に戻す"
+          disabled={Boolean(editLocked) || !session.undo_enabled}
+          title={editLocked ?? session.undo_hint}
+          onClick={() => void runCommand({ type: "undo" })}
+        />
+        <TipButton
+          label="やり直す"
+          disabled={Boolean(editLocked) || !session.redo_enabled}
+          title={editLocked ?? session.redo_hint}
+          onClick={() => void runCommand({ type: "redo" })}
+        />
+        <TipButton
+          label="左回転"
+          disabled={selectionReason !== undefined}
+          reason={selectionReason}
+          onClick={() => rotateSelection("left")}
+        />
+        <TipButton
+          label="右回転"
+          disabled={selectionReason !== undefined}
+          reason={selectionReason}
+          onClick={() => rotateSelection("right")}
+        />
+        <TipButton
+          label="削除"
+          disabled={selectionReason !== undefined}
+          reason={selectionReason}
+          onClick={deleteSelection}
+        />
+        <form className="jump" onSubmit={(event) => event.preventDefault()}>
+          <input
+            aria-label="移動先のページ番号"
+            inputMode="numeric"
+            value={moveText}
+            onChange={(event) => setMoveText(event.target.value)}
+          />
+          <TipButton
+            label="その前へ"
+            disabled={selectionReason !== undefined}
+            reason={selectionReason}
+            onClick={() => moveSelection("before")}
+          />
+          <TipButton
+            label="その後へ"
+            disabled={selectionReason !== undefined}
+            reason={selectionReason}
+            onClick={() => moveSelection("after")}
+          />
+        </form>
         <TipButton label="前へ" disabled={previousReason !== undefined} reason={previousReason} onClick={() => move(-1)} />
         <TipButton label="次へ" disabled={nextReason !== undefined} reason={nextReason} onClick={() => move(1)} />
         <TipButton
@@ -577,7 +747,13 @@ export function App() {
           reason="設定の読み込みが終わると使えます。"
           onClick={() => chooseSize("large")}
         />
-        <button type="button" className="export-button" disabled={pages.length === 0 || busy} onClick={() => void exportAll()}>
+        <button
+          type="button"
+          className="export-button"
+          disabled={pages.length === 0 || busy}
+          title={pages.length === 0 ? "見えているページがないため書き出せません。" : undefined}
+          onClick={() => void exportAll()}
+        >
           全ページを書き出す
         </button>
         <form className="jump" onSubmit={(event) => void jump(event)}>
@@ -601,6 +777,15 @@ export function App() {
           </button>
         </p>
       ) : null}
+      {removedCount != null ? (
+        <p className="result">
+          {removedCount}ページを削除しました
+          <button type="button" onClick={() => void runCommand({ type: "undo" })}>
+            元に戻す
+          </button>
+        </p>
+      ) : null}
+      {toast ? <p className="result">{toast}</p> : null}
       {waiting ? <p className="result">{waiting}</p> : null}
       {progress && progress.stage !== "completed" ? (
         <p className="result">
@@ -654,7 +839,11 @@ export function App() {
               activeId={session.active_page_id}
               layout={settings.thumbnail_layout}
               frameHeight={frameHeight}
-              onActivate={activate}
+              onSelect={selectByPointer}
+              onRotate={(pageId, direction) => void runCommand({ type: "rotate", page_ids: [pageId], direction })}
+              onDelete={(pageId) => void runCommand({ type: "delete", page_ids: [pageId] })}
+              onReorder={reorderPages}
+              onUnchangedReorder={() => showToast("並びは変わっていません")}
               onBlank={() => void applySelection(clearSelection())}
               onColumns={onColumns}
             />

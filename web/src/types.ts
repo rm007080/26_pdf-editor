@@ -17,7 +17,23 @@ export type SessionState = {
   pages: PageRecord[];
   selected_page_ids: string[];
   active_page_id: string | null;
+  undo_enabled: boolean;
+  redo_enabled: boolean;
+  undo_hint: string;
+  redo_hint: string;
 };
+
+export type CommandResult = SessionState & {
+  changed: boolean;
+  history_dropped: boolean;
+};
+
+export type EditCommand =
+  | { type: "rotate"; page_ids: string[]; direction: "left" | "right" }
+  | { type: "delete"; page_ids: string[] }
+  | { type: "reorder"; page_ids: string[]; before_page_id?: string; after_page_id?: string }
+  | { type: "undo" }
+  | { type: "redo" };
 
 export type ThumbnailLayout = "row" | "grid";
 export type ThumbnailSize = "small" | "medium" | "large";
