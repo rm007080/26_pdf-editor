@@ -1,0 +1,170 @@
+:root {
+  color: #1d1914;
+  background: #efe6d6;
+  font-family: "Yu Gothic UI", "Segoe UI", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+.app {
+  min-height: 100vh;
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+}
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: center;
+  padding: 0.8rem 1rem;
+  background: #243028;
+  color: #f6f1e7;
+}
+
+.toolbar h1 {
+  margin: 0;
+  font-size: 1.05rem;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+}
+
+.file-button {
+  position: relative;
+  background: #f6f1e7;
+  color: #243028;
+  border-radius: 999px;
+  padding: 0.35rem 0.8rem;
+  cursor: pointer;
+}
+
+.file-button input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+}
+
+.toolbar button,
+.result button {
+  border: 0;
+  border-radius: 999px;
+  padding: 0.4rem 0.85rem;
+  background: #f6f1e7;
+  color: #243028;
+  cursor: pointer;
+}
+
+.toolbar button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.export-button {
+  background: #c4552a;
+  color: #fff8f3;
+}
+
+.page-label {
+  margin-left: auto;
+}
+
+.stage {
+  min-height: 0;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+}
+
+.preview-frame,
+.thumb-frame {
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+}
+
+.preview-frame {
+  width: min(920px, 100%);
+  height: min(68vh, 820px);
+  background: #f7f1e6;
+  border: 1px solid #d9cbb6;
+  box-shadow: 0 12px 30px rgba(36, 48, 40, 0.08);
+}
+
+.preview-frame canvas,
+.thumb-frame canvas {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+}
+
+.empty {
+  margin: 0;
+  color: #5d564c;
+}
+
+.notice,
+.result {
+  margin: 0;
+  padding: 0.65rem 1rem;
+  background: #fffaf3;
+}
+
+.notice {
+  color: #8a2e16;
+}
+
+.thumbs {
+  display: flex;
+  gap: 0.75rem;
+  overflow-x: auto;
+  padding: 0.75rem 1rem 1rem;
+  background: #e7dccb;
+}
+
+.thumb {
+  width: 148px;
+  flex: 0 0 auto;
+  display: grid;
+  gap: 0.2rem;
+  padding: 0.45rem;
+  border: 1px solid transparent;
+  background: #f7f1e6;
+  text-align: left;
+  cursor: pointer;
+}
+
+.thumb.active {
+  border-color: #c4552a;
+}
+
+.thumb-frame {
+  height: 150px;
+  background: #fff;
+}
+
+.thumb span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.75rem;
+}
+
+.result {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  align-items: center;
+}
