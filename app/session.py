@@ -16,7 +16,17 @@ def default_app_temp_dir() -> Path:
 UNDO_LIMIT = 100
 EMPTY_UNDO_HINT = "元に戻せる操作がありません。実行しても状態は変わりません"
 EMPTY_REDO_HINT = "やり直せる操作がありません。実行しても状態は変わりません"
-CLIENT_COMMANDS = {"rotate", "delete", "reorder", "append_documents", "undo", "redo"}
+CLIENT_COMMANDS = {
+    "rotate",
+    "delete",
+    "reorder",
+    "append_documents",
+    "set_split",
+    "clear_split",
+    "clear_all_splits",
+    "undo",
+    "redo",
+}
 
 
 class LoadError(Exception):
@@ -48,6 +58,8 @@ class Session:
         self._hashes: dict[str, str] = {}
         self._catalog: dict[str, str] = {}
         self._baseline: list[tuple[str, int, int]] = []
+        self._split_positions: list[int] = []
+        self._split_exported: list[frozenset[str]] | None = None
         self.pause_during_load = None
         self.before_commit = None
         self.fail_decrypt_save = None
@@ -69,6 +81,8 @@ class Session:
             self._hashes = {}
             self._catalog = {}
             self._baseline = []
+            self._split_positions = []
+            self._split_exported = None
             self._activity = Activity.IDLE
 
     def shutdown(self) -> None:
@@ -133,6 +147,11 @@ class Session:
                 if detail is not None:
                     return 400, {"detail": detail}
                 return self._apply_append_unlocked(body)
+            if kind in {"set_split", "clear_split", "clear_all_splits"}:
+                detail = self._split_command_error(body)
+                if detail is not None:
+                    return 400, {"detail": detail}
+                return self._apply_split_unlocked(body)
             detail = self._user_command_error(body)
             if detail is not None:
                 return 400, {"detail": detail}
@@ -150,6 +169,8 @@ class Session:
             "selected_page_ids": self._sorted_ids(self.selected_page_ids),
             "active_page_id": self.active_page_id,
             "unsaved": self._output_state() != self._baseline,
+            "split_positions": list(self._split_positions),
+            "split_unexported": self._split_unexported_unlocked(),
             **self._history_fields(),
         }
 
@@ -297,6 +318,51 @@ class Session:
                 return "受け取っていない PDF は追加できません"
         return None
 
+    def _split_command_error(self, body: dict) -> str | None:
+        kind = body["type"]
+        if kind == "clear_all_splits":
+            if set(body) != {"type"}:
+                return "分割線の指定が不正です"
+            return None
+        if kind == "set_split" and ("page_ids" in body or "after_page_ids" in body):
+            return "分割線の指定が不正です"
+        if set(body) != {"type", "after_page_id"}:
+            return "分割線の指定が不正です"
+        after_page_id = body.get("after_page_id")
+        if not isinstance(after_page_id, str):
+            return "分割線の指定が不正です"
+        return self._split_anchor_error(after_page_id)
+
+    def _split_anchor_error(self, page_id: str) -> str | None:
+        known = {str(page["id"]) for page in self.pages}
+        if page_id not in known:
+            return "不明なページは操作できません"
+        visible = self._visible_ids()
+        if page_id not in visible:
+            return "見えていないページは操作できません"
+        if page_id == visible[-1]:
+            return "末尾のページの後ろには分割線を入れられません"
+        return None
+
+    def _apply_split_unlocked(self, body: dict) -> tuple[int, dict]:
+        normalized = self._normalize(body, [])
+        before_selected = list(self.selected_page_ids)
+        before_active = self.active_page_id
+        inverse = self._inverse(normalized, [])
+        if not self._mutate(normalized):
+            return 200, self._command_response(False, False)
+        self._redo = []
+        record = {
+            "inverse": inverse,
+            "original": normalized,
+            "before_selected": before_selected,
+            "before_active": before_active,
+            "after_selected": list(self.selected_page_ids),
+            "after_active": self.active_page_id,
+        }
+        dropped = self._push_undo(record)
+        return 200, self._command_response(True, dropped)
+
     def _apply_append_unlocked(self, body: dict) -> tuple[int, dict]:
         document_ids = list(body["document_ids"])
         was_empty = len(self.documents) == 0
@@ -360,7 +426,10 @@ class Session:
         if not self._undo:
             return 400, {"detail": "元に戻せる操作がありません"}
         record = self._undo.pop()
-        self._mutate(record["inverse"])
+        inverse = record["inverse"]
+        if isinstance(inverse, dict) and inverse.get("type") == "remove_documents":
+            record["split_positions"] = list(self._split_positions)
+        self._mutate(inverse)
         self._assign_selection(list(record["before_selected"]), record["before_active"])
         self._redo.append(record)
         return 200, self._command_response(True, False)
@@ -370,6 +439,14 @@ class Session:
             return 400, {"detail": "やり直せる操作がありません"}
         record = self._redo.pop()
         self._mutate(record["original"])
+        original = record["original"]
+        if (
+            isinstance(original, dict)
+            and original.get("type") == "append_documents"
+            and "split_positions" in record
+        ):
+            stored = record["split_positions"]
+            self._split_positions = self._normalize_splits([int(item) for item in stored])
         self._assign_selection(list(record["after_selected"]), record["after_active"])
         dropped = self._push_undo(record)
         return 200, self._command_response(True, dropped)
@@ -389,6 +466,12 @@ class Session:
         return [page_id for page_id in self._visible_ids() if page_id in wanted]
 
     def _normalize(self, body: dict, ordered: list[str]) -> dict[str, object]:
+        if body["type"] == "set_split":
+            return {"type": "set_split", "after_page_id": body["after_page_id"]}
+        if body["type"] == "clear_split":
+            return {"type": "clear_split", "after_page_id": body["after_page_id"]}
+        if body["type"] == "clear_all_splits":
+            return {"type": "clear_all_splits"}
         if body["type"] == "rotate":
             return {"type": "rotate", "page_ids": ordered, "direction": body["direction"]}
         if body["type"] == "delete":
@@ -401,6 +484,16 @@ class Session:
         return command
 
     def _inverse(self, command: dict[str, object], ordered: list[str]) -> dict[str, object]:
+        if command["type"] == "set_split" and "after_page_ids" not in command:
+            return {"type": "clear_split", "after_page_id": command["after_page_id"]}
+        if command["type"] == "clear_split":
+            return {"type": "set_split", "after_page_id": command["after_page_id"]}
+        if command["type"] == "clear_all_splits":
+            visible = self._visible_ids()
+            return {
+                "type": "set_split",
+                "after_page_ids": [visible[position - 1] for position in self._split_positions],
+            }
         if command["type"] == "rotate":
             direction = "left" if command["direction"] == "right" else "right"
             return {"type": "rotate", "page_ids": list(ordered), "direction": direction}
@@ -415,8 +508,13 @@ class Session:
                     "after_page_id": None if index == 0 else visible[index - 1],
                 }
             )
-        kind = "restore_deleted" if command["type"] == "delete" else "restore_order"
-        return {"type": kind, "pages": places}
+        if command["type"] == "delete":
+            return {
+                "type": "restore_deleted",
+                "pages": places,
+                "split_positions": list(self._split_positions),
+            }
+        return {"type": "restore_order", "pages": places}
 
     def _selection_after_delete(
         self, deleted_ids: list[str], before_visible: list[str]
@@ -452,6 +550,15 @@ class Session:
 
     def _mutate(self, command: dict[str, object]) -> bool:
         kind = command["type"]
+        if kind == "set_split":
+            return self._mutate_set_split(command)
+        if kind == "clear_split":
+            return self._mutate_clear_split(command)
+        if kind == "clear_all_splits":
+            if not self._split_positions:
+                return False
+            self._split_positions = []
+            return True
         if kind == "rotate":
             delta = 90 if command["direction"] == "right" else -90
             targets = set(command["page_ids"])
@@ -460,10 +567,13 @@ class Session:
                     page["rotation"] = (int(page["rotation"]) + delta) % 360
             return True
         if kind == "delete":
+            visible = self._visible_ids()
+            removed_positions = [visible.index(str(page_id)) + 1 for page_id in command["page_ids"]]
             targets = set(command["page_ids"])
             for page in self.pages:
                 if page["id"] in targets:
                     page["deleted"] = True
+            self._compact_split_positions(removed_positions)
             self._apply_sequence(self._visible_ids())
             return True
         if kind == "reorder":
@@ -471,10 +581,79 @@ class Session:
         if kind == "append_documents":
             return self._place_documents(list(command["document_ids"]))
         if kind == "remove_documents":
+            visible = self._visible_pages_unlocked()
+            removing = {str(document_id) for document_id in command["document_ids"]}
+            removed_positions = [
+                index
+                for index, page in enumerate(visible, start=1)
+                if str(page["document_id"]) in removing
+            ]
             self._detach_documents(list(command["document_ids"]))
+            self._compact_split_positions(removed_positions)
+            return True
+        if kind == "restore_deleted":
+            self._reinsert(command["pages"])
+            stored = command["split_positions"]
+            self._split_positions = self._normalize_splits([int(item) for item in stored])
             return True
         self._reinsert(command["pages"])
         return True
+
+    def _mutate_set_split(self, command: dict[str, object]) -> bool:
+        visible = self._visible_ids()
+        if "after_page_ids" in command:
+            index = {page_id: position for position, page_id in enumerate(visible, start=1)}
+            positions = [index[str(page_id)] for page_id in command["after_page_ids"] if str(page_id) in index]
+            normalized = self._normalize_splits(positions)
+            if normalized == self._split_positions:
+                return False
+            self._split_positions = normalized
+            return True
+        position = visible.index(str(command["after_page_id"])) + 1
+        if position in self._split_positions:
+            return False
+        self._split_positions = self._normalize_splits([*self._split_positions, position])
+        return True
+
+    def _mutate_clear_split(self, command: dict[str, object]) -> bool:
+        visible = self._visible_ids()
+        position = visible.index(str(command["after_page_id"])) + 1
+        if position not in self._split_positions:
+            return False
+        self._split_positions = [item for item in self._split_positions if item != position]
+        return True
+
+    def _compact_split_positions(self, removed_positions: list[int]) -> None:
+        removed = sorted(removed_positions)
+        shifted: list[int] = []
+        for position in self._split_positions:
+            shift = sum(1 for item in removed if item <= position)
+            shifted.append(position - shift)
+        self._split_positions = self._normalize_splits(shifted)
+
+    def _normalize_splits(self, positions: list[int]) -> list[int]:
+        count = len(self._visible_ids())
+        kept = {
+            position
+            for position in positions
+            if isinstance(position, int) and not isinstance(position, bool) and 1 <= position <= count - 1
+        }
+        return sorted(kept)
+
+    def _groups_unlocked(self) -> list[list[dict[str, object]]]:
+        visible = self._visible_pages_unlocked()
+        if not visible:
+            return []
+        bounds = [0, *self._split_positions, len(visible)]
+        return [visible[start:end] for start, end in zip(bounds, bounds[1:])]
+
+    def _split_unexported_unlocked(self) -> bool:
+        if not self._split_positions:
+            return False
+        if self._split_exported is None:
+            return True
+        current = [frozenset(str(page["id"]) for page in group) for group in self._groups_unlocked()]
+        return current != self._split_exported
 
     def _reorder(self, command: dict[str, object]) -> bool:
         moving = list(command["page_ids"])
@@ -577,29 +756,72 @@ class Session:
 
     def export_plan(self) -> dict[str, object] | None:
         with self._lock:
-            pages = self._visible_pages_unlocked()
-            if not pages:
+            return self._export_plan_unlocked(None)
+
+    def selection_export_plan(self) -> dict[str, object] | None:
+        with self._lock:
+            if not self.selected_page_ids:
                 return None
-            visible_docs = {str(page["document_id"]) for page in pages}
-            filename = next(
-                (document["filename"] for document in self.documents if document["id"] in visible_docs),
-                None,
-            )
-            if filename is None:
+            return self._export_plan_unlocked(set(self.selected_page_ids))
+
+    def split_proposal(self) -> dict[str, object] | None:
+        with self._lock:
+            visible = self._visible_pages_unlocked()
+            if not visible:
                 return None
-            page_plan = [
-                (str(page["document_id"]), int(page["source_page"]), int(page["rotation"]))
-                for page in pages
-            ]
-            paths: dict[str, Path] = {}
-            required = 0
-            for document_id, _source_page, _rotation in page_plan:
-                if document_id in paths:
-                    continue
-                path = self._copies[document_id]
-                paths[document_id] = path
-                required += path.stat().st_size
-            return {"filename": filename, "pages": page_plan, "bytes": required, "paths": paths}
+            groups = self._groups_unlocked()
+            paths, required = self._source_budget(visible)
+            return {
+                "stem": Path(self._filename_for(visible)).stem,
+                "groups": [
+                    {
+                        "page_ids": [str(page["id"]) for page in group],
+                        "pages": [
+                            (str(page["document_id"]), int(page["source_page"]), int(page["rotation"]))
+                            for page in group
+                        ],
+                    }
+                    for group in groups
+                ],
+                "bytes": required,
+                "paths": paths,
+            }
+
+    def mark_split_exported(self, groups: list[list[str]]) -> None:
+        with self._lock:
+            self._split_exported = [frozenset(group) for group in groups]
+
+    def _export_plan_unlocked(self, only: set[str] | None) -> dict[str, object] | None:
+        pages = self._visible_pages_unlocked()
+        if only is not None:
+            pages = [page for page in pages if str(page["id"]) in only]
+        if not pages:
+            return None
+        page_plan = [
+            (str(page["document_id"]), int(page["source_page"]), int(page["rotation"]))
+            for page in pages
+        ]
+        paths, required = self._source_budget(pages)
+        return {"filename": self._filename_for(pages), "pages": page_plan, "bytes": required, "paths": paths}
+
+    def _filename_for(self, pages: list[dict[str, object]]) -> str:
+        visible_docs = {str(page["document_id"]) for page in pages}
+        for document in self.documents:
+            if document["id"] in visible_docs:
+                return str(document["filename"])
+        raise RuntimeError("見えているページの追加単位がありません")
+
+    def _source_budget(self, pages: list[dict[str, object]]) -> tuple[dict[str, Path], int]:
+        paths: dict[str, Path] = {}
+        required = 0
+        for page in pages:
+            document_id = str(page["document_id"])
+            if document_id in paths:
+                continue
+            path = self._copies[document_id]
+            paths[document_id] = path
+            required += path.stat().st_size
+        return paths, required
 
     def mark_saved(self, pages: list[tuple[str, int, int]]) -> None:
         with self._lock:
@@ -891,4 +1113,12 @@ def _operation_phrase(command: object) -> str:
         return "PDFを追加する"
     if kind == "remove_documents":
         return "追加したPDFを外す"
+    if kind == "set_split":
+        if "after_page_ids" in command:
+            return "解除した分割線を戻す"
+        return "分割線を入れる"
+    if kind == "clear_split":
+        return "分割線を外す"
+    if kind == "clear_all_splits":
+        return "すべての分割線を解除する"
     return "操作する"

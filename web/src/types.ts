@@ -22,6 +22,8 @@ export type SessionState = {
   undo_hint: string;
   redo_hint: string;
   unsaved: boolean;
+  split_positions: number[];
+  split_unexported: boolean;
 };
 
 export type CommandResult = SessionState & {
@@ -43,6 +45,9 @@ export type EditCommand =
   | { type: "delete"; page_ids: string[] }
   | { type: "reorder"; page_ids: string[]; before_page_id?: string; after_page_id?: string }
   | { type: "append_documents"; document_ids: string[] }
+  | { type: "set_split"; after_page_id: string }
+  | { type: "clear_split"; after_page_id: string }
+  | { type: "clear_all_splits" }
   | { type: "undo" }
   | { type: "redo" };
 
@@ -64,9 +69,19 @@ export type ExportJob = {
   total_pages: number;
   ratio: number;
   path: string | null;
+  files?: string[];
   detail: string | null;
 };
 
 export type ExportStart =
   | { status: "cancelled" }
   | { job_id: string };
+
+export type SplitFileProposal = {
+  name: string;
+  pages: number;
+};
+
+export type SplitBegin =
+  | { status: "cancelled" }
+  | { status: "naming"; files: SplitFileProposal[] };

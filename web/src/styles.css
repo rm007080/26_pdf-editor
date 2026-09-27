@@ -104,6 +104,81 @@ input {
   color: #fff8f3;
 }
 
+.export-menu {
+  position: relative;
+}
+
+.export-menu summary {
+  list-style: none;
+  border-radius: 999px;
+  padding: 0.4rem 0.85rem;
+  background: #f6f1e7;
+  cursor: pointer;
+}
+
+.export-menu summary::-webkit-details-marker {
+  display: none;
+}
+
+.menu-panel {
+  position: absolute;
+  z-index: 5;
+  top: calc(100% + 0.35rem);
+  left: 0;
+  display: grid;
+  gap: 0.35rem;
+  min-width: 10rem;
+  padding: 0.45rem;
+  border-radius: 0.8rem;
+  background: #fffaf3;
+  box-shadow: 0 8px 24px rgba(36, 48, 40, 0.16);
+}
+
+.name-row {
+  display: grid;
+  gap: 0.3rem;
+  margin-bottom: 0.75rem;
+}
+
+.name-row input {
+  border: 0;
+  border-radius: 999px;
+  padding: 0.45rem 0.8rem;
+  color: #243028;
+}
+
+.split-line {
+  flex: 0 0 auto;
+  align-self: stretch;
+  width: 20px;
+  margin: 0 -4px;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  position: relative;
+}
+
+.split-line::before {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 0.75rem;
+  bottom: 0.75rem;
+  width: 2px;
+  transform: translateX(-50%);
+  background: #8a7b68;
+}
+
+.split-line.on::before {
+  width: 4px;
+  background: #c4552a;
+}
+
+.split-line:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
 .page-label,
 .zoom-label {
   margin-left: auto;

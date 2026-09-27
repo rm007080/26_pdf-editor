@@ -148,6 +148,29 @@ def create_app(session: Session | None = None, settings_path: Path | None = None
         status, body = await exporter.begin_export()
         return JSONResponse(status_code=status, content=body)
 
+    @app.post("/api/exports/selection")
+    async def export_selection() -> JSONResponse:
+        status, body = await exporter.begin_selection()
+        return JSONResponse(status_code=status, content=body)
+
+    @app.post("/api/exports/split")
+    async def export_split() -> JSONResponse:
+        status, body = await exporter.begin_split()
+        return JSONResponse(status_code=status, content=body)
+
+    @app.post("/api/exports/split/confirm")
+    async def export_split_confirm(request: Request) -> JSONResponse:
+        body, error = await read_json_body(request, "ファイル名の指定が不正です")
+        if error is not None:
+            return error
+        status, payload = await exporter.confirm_split(body)
+        return JSONResponse(status_code=status, content=payload)
+
+    @app.post("/api/exports/split/cancel")
+    def export_split_cancel() -> JSONResponse:
+        status, payload = exporter.cancel_split()
+        return JSONResponse(status_code=status, content=payload)
+
     @app.get("/api/exports/{job_id}")
     def export_status(job_id: str):
         body = exporter.job_view(job_id)
@@ -156,9 +179,15 @@ def create_app(session: Session | None = None, settings_path: Path | None = None
         return body
 
     @app.post("/api/exports/{job_id}/open-file")
-    def export_open_file(job_id: str) -> JSONResponse:
-        status, body = exporter.open_saved_file(job_id)
-        return JSONResponse(status_code=status, content=body)
+    async def export_open_file(job_id: str, request: Request) -> JSONResponse:
+        content_type = request.headers.get("content-type", "")
+        body = None
+        if content_type.startswith("application/json"):
+            body, error = await read_json_body(request, "開き方の指定が不正です")
+            if error is not None:
+                return error
+        status, payload = exporter.open_saved_file(job_id, body)
+        return JSONResponse(status_code=status, content=payload)
 
     @app.post("/api/exports/{job_id}/open-folder")
     def export_open_folder(job_id: str) -> JSONResponse:

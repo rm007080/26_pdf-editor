@@ -144,6 +144,8 @@ def test_empty_session(env):
         "undo_hint": "元に戻せる操作がありません。実行しても状態は変わりません",
         "redo_hint": "やり直せる操作がありません。実行しても状態は変わりません",
         "unsaved": False,
+        "split_positions": [],
+        "split_unexported": False,
     }
 
 
@@ -1529,3 +1531,217 @@ def test_failed_decrypt_save_keeps_encrypted_intake_and_shared_copy(env, tmp_pat
     assert recovered.status_code == 200
     assert recovered.json()["needs_password"] is False
     assert stored_copies(session) == plain
+
+
+def visible_ids(body: dict) -> list[str]:
+    pages = [page for page in body["pages"] if not page["deleted"]]
+    pages.sort(key=lambda page: page["order"])
+    return [page["id"] for page in pages]
+
+
+def test_set_split_and_clear_split_change_one_line(env, tmp_path):
+    client, app, _session = env
+    source = tmp_path / "sample.pdf"
+    write_pdf(source, pages=4)
+    loaded = load_pdf(client, app, source)
+    ids = visible_ids(loaded)
+    placed = post_command(client, app, {"type": "set_split", "after_page_id": ids[1]})
+    assert placed.status_code == 200
+    assert placed.json()["changed"] is True
+    assert placed.json()["split_positions"] == [2]
+    assert placed.json()["split_unexported"] is True
+    assert placed.json()["undo_hint"] == "分割線を外す"
+    assert placed.json()["selected_page_ids"] == loaded["selected_page_ids"]
+
+    again = post_command(client, app, {"type": "set_split", "after_page_id": ids[1]})
+    assert again.status_code == 200
+    assert again.json()["changed"] is False
+    assert again.json()["split_positions"] == [2]
+
+    undone = post_command(client, app, {"type": "undo"})
+    assert undone.status_code == 200
+    assert undone.json()["split_positions"] == []
+    assert undone.json()["undo_hint"] == "追加したPDFを外す"
+
+    placed = post_command(client, app, {"type": "set_split", "after_page_id": ids[1]})
+    cleared = post_command(client, app, {"type": "clear_split", "after_page_id": ids[1]})
+    assert cleared.status_code == 200
+    assert cleared.json()["changed"] is True
+    assert cleared.json()["split_positions"] == []
+    assert cleared.json()["undo_hint"] == "分割線を入れる"
+    missing = post_command(client, app, {"type": "clear_split", "after_page_id": ids[1]})
+    assert missing.status_code == 200
+    assert missing.json()["changed"] is False
+    assert post_command(client, app, {"type": "undo"}).json()["split_positions"] == [2]
+
+
+def test_split_rejects_last_unknown_and_hidden_pages_without_changes(env, tmp_path):
+    client, app, _session = env
+    source = tmp_path / "sample.pdf"
+    write_pdf(source, pages=4)
+    loaded = load_pdf(client, app, source)
+    ids = visible_ids(loaded)
+    before = client.get("/api/session", headers=auth(app)).json()
+
+    last = post_command(client, app, {"type": "set_split", "after_page_id": ids[-1]})
+    unknown = post_command(client, app, {"type": "set_split", "after_page_id": "missing"})
+    assert last.status_code == 400
+    assert unknown.status_code == 400
+    assert client.get("/api/session", headers=auth(app)).json() == before
+
+    deleted = post_command(client, app, {"type": "delete", "page_ids": [ids[0]]})
+    assert deleted.status_code == 200
+    hidden = post_command(client, app, {"type": "set_split", "after_page_id": ids[0]})
+    assert hidden.status_code == 400
+    current = client.get("/api/session", headers=auth(app)).json()
+    assert current["split_positions"] == []
+    assert current["undo_enabled"] is True
+    assert current["pages"] == deleted.json()["pages"]
+
+
+def test_delete_compacts_split_and_reorder_keeps_position(env, tmp_path):
+    client, app, _session = env
+    source = tmp_path / "sample.pdf"
+    write_pdf(source, pages=4)
+    loaded = load_pdf(client, app, source)
+    ids = visible_ids(loaded)
+    assert post_command(client, app, {"type": "set_split", "after_page_id": ids[1]}).json()["split_positions"] == [2]
+
+    deleted = post_command(client, app, {"type": "delete", "page_ids": [ids[1]]})
+    assert deleted.status_code == 200
+    assert deleted.json()["split_positions"] == [1]
+    assert visible_ids(deleted.json()) == [ids[0], ids[2], ids[3]]
+
+    restored = post_command(client, app, {"type": "undo"})
+    assert restored.json()["split_positions"] == [2]
+    assert visible_ids(restored.json()) == ids
+
+    redone = post_command(client, app, {"type": "redo"})
+    assert redone.json()["split_positions"] == [1]
+    assert post_command(client, app, {"type": "undo"}).json()["split_positions"] == [2]
+
+    moved = post_command(
+        client,
+        app,
+        {"type": "reorder", "page_ids": [ids[2]], "before_page_id": ids[0]},
+    )
+    assert moved.json()["split_positions"] == [2]
+    assert visible_ids(moved.json()) == [ids[2], ids[0], ids[1], ids[3]]
+
+
+def test_empty_split_is_removed(env, tmp_path):
+    client, app, _session = env
+    source = tmp_path / "sample.pdf"
+    write_pdf(source, pages=3)
+    loaded = load_pdf(client, app, source)
+    ids = visible_ids(loaded)
+    assert post_command(client, app, {"type": "set_split", "after_page_id": ids[0]}).json()["split_positions"] == [1]
+    deleted = post_command(client, app, {"type": "delete", "page_ids": [ids[0]]})
+    assert deleted.json()["split_positions"] == []
+    assert deleted.json()["split_unexported"] is False
+
+
+def test_clear_all_splits_is_one_undo(env, tmp_path):
+    client, app, _session = env
+    source = tmp_path / "sample.pdf"
+    write_pdf(source, pages=4)
+    loaded = load_pdf(client, app, source)
+    ids = visible_ids(loaded)
+    assert post_command(client, app, {"type": "set_split", "after_page_id": ids[0]}).status_code == 200
+    assert post_command(client, app, {"type": "set_split", "after_page_id": ids[2]}).json()["split_positions"] == [1, 3]
+    cleared = post_command(client, app, {"type": "clear_all_splits"})
+    assert cleared.status_code == 200
+    assert cleared.json()["changed"] is True
+    assert cleared.json()["split_positions"] == []
+    assert cleared.json()["undo_hint"] == "解除した分割線を戻す"
+
+    restored = post_command(client, app, {"type": "undo"})
+    assert restored.json()["split_positions"] == [1, 3]
+    assert restored.json()["redo_hint"] == "すべての分割線を解除する"
+
+
+def test_clear_all_splits_with_no_lines_is_not_history(env, tmp_path):
+    client, app, _session = env
+    source = tmp_path / "sample.pdf"
+    write_pdf(source, pages=2)
+    load_pdf(client, app, source)
+    noop = post_command(client, app, {"type": "clear_all_splits"})
+    assert noop.status_code == 200
+    assert noop.json()["changed"] is False
+    assert noop.json()["split_positions"] == []
+    assert noop.json()["undo_hint"] == "追加したPDFを外す"
+
+
+def test_client_cannot_send_split_identifiers_in_bulk(env, tmp_path):
+    client, app, _session = env
+    source = tmp_path / "sample.pdf"
+    write_pdf(source, pages=4)
+    loaded = load_pdf(client, app, source)
+    ids = visible_ids(loaded)
+    before = client.get("/api/session", headers=auth(app)).json()
+    cases = [
+        {"type": "set_split", "after_page_ids": [ids[0], ids[1]]},
+        {"type": "set_split", "after_page_id": ids[0], "page_ids": [ids[0]]},
+        {"type": "set_split", "after_page_id": ids[0], "after_page_ids": [ids[0]]},
+        {"type": "clear_all_splits", "after_page_ids": [ids[0]]},
+        {"type": "clear_all_splits", "page_ids": [ids[0]]},
+    ]
+    for body in cases:
+        response = post_command(client, app, body)
+        assert response.status_code == 400, body
+        assert client.get("/api/session", headers=auth(app)).json() == before
+
+
+def test_selection_patch_keeps_split_fields(env, tmp_path):
+    client, app, _session = env
+    source = tmp_path / "sample.pdf"
+    write_pdf(source, pages=3)
+    loaded = load_pdf(client, app, source)
+    ids = visible_ids(loaded)
+    placed = post_command(client, app, {"type": "set_split", "after_page_id": ids[0]})
+    patched = patch_selection(client, app, [ids[1]], ids[1])
+    assert patched.status_code == 200
+    assert patched.json()["split_positions"] == [1]
+    assert patched.json()["split_unexported"] is True
+    assert patched.json()["selected_page_ids"] == [ids[1]]
+    assert "changed" not in patched.json()
+    assert placed.json()["split_positions"] == patched.json()["split_positions"]
+
+
+def test_append_undo_restores_split_positions_around_reorder(env, tmp_path):
+    client, app, _session = env
+    first = tmp_path / "first.pdf"
+    second = tmp_path / "second.pdf"
+    write_pdf(first, pages=4)
+    write_pdf(second, pages=2)
+    loaded = load_pdf(client, app, first)
+    ids = visible_ids(loaded)
+    assert post_command(client, app, {"type": "set_split", "after_page_id": ids[1]}).json()["split_positions"] == [2]
+    extra = post_file(client, app, second)
+    appended = post_command(client, app, {"type": "append_documents", "document_ids": [extra.json()["document_id"]]})
+    assert appended.status_code == 200
+    added = [page_id for page_id in visible_ids(appended.json()) if page_id not in ids]
+    assert appended.json()["split_positions"] == [2]
+    assert visible_ids(appended.json())[-2:] == added
+
+    assert patch_selection(client, app, added, added[-1]).status_code == 200
+    moved = post_command(client, app, {"type": "reorder", "page_ids": added, "before_page_id": ids[0]})
+    assert moved.status_code == 200
+    assert moved.json()["split_positions"] == [2]
+    assert visible_ids(moved.json())[:2] == added
+
+    undone_move = post_command(client, app, {"type": "undo"})
+    assert undone_move.json()["split_positions"] == [2]
+    assert visible_ids(undone_move.json())[-2:] == added
+
+    undone_append = post_command(client, app, {"type": "undo"})
+    assert undone_append.json()["split_positions"] == [2]
+    assert visible_ids(undone_append.json()) == ids
+
+    redone_append = post_command(client, app, {"type": "redo"})
+    assert redone_append.json()["split_positions"] == [2]
+    assert visible_ids(redone_append.json())[-2:] == added
+
+    redone_move = post_command(client, app, {"type": "redo"})
+    assert redone_move.json()["split_positions"] == [2]
+    assert visible_ids(redone_move.json())[:2] == added

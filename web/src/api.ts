@@ -5,6 +5,7 @@ import type {
   ExportJob,
   ExportStart,
   SessionState,
+  SplitBegin,
   ViewSettings,
 } from "./types";
 
@@ -106,12 +107,46 @@ export function postExport(token: string): Promise<ExportStart> {
   );
 }
 
+export function postSelectionExport(token: string): Promise<ExportStart> {
+  return request(token, "/api/exports/selection", { method: "POST" }).then((response) =>
+    readJson<ExportStart>(response),
+  );
+}
+
+export function postSplit(token: string): Promise<SplitBegin> {
+  return request(token, "/api/exports/split", { method: "POST" }).then((response) =>
+    readJson<SplitBegin>(response),
+  );
+}
+
+export function postSplitConfirm(token: string, names: string[]): Promise<{ job_id: string }> {
+  return request(token, "/api/exports/split/confirm", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ names }),
+  }).then((response) => readJson<{ job_id: string }>(response));
+}
+
+export function postSplitCancel(token: string): Promise<{ status: string }> {
+  return request(token, "/api/exports/split/cancel", { method: "POST" }).then((response) =>
+    readJson<{ status: string }>(response),
+  );
+}
+
 export function getExportJob(token: string, jobId: string): Promise<ExportJob> {
   return request(token, `/api/exports/${jobId}`).then((response) => readJson<ExportJob>(response));
 }
 
-export function openSaved(token: string, jobId: string, kind: "open-file" | "open-folder"): Promise<void> {
-  return request(token, `/api/exports/${jobId}/${kind}`, { method: "POST" }).then((response) =>
-    readJson(response),
-  );
+export function openSaved(
+  token: string,
+  jobId: string,
+  kind: "open-file" | "open-folder",
+  index?: number,
+): Promise<void> {
+  const init: RequestInit = { method: "POST" };
+  if (index !== undefined) {
+    init.headers = { "Content-Type": "application/json" };
+    init.body = JSON.stringify({ index });
+  }
+  return request(token, `/api/exports/${jobId}/${kind}`, init).then((response) => readJson(response));
 }

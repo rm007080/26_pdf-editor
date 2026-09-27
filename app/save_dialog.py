@@ -88,6 +88,10 @@ def ask_save_path(initial_dir: Path, initial_filename: str) -> Path | None:
     return _call_on_sta(_show_save_dialog, initial_dir, initial_filename)
 
 
+def ask_folder(initial_dir: Path) -> Path | None:
+    return _call_on_sta(_show_folder_dialog, initial_dir)
+
+
 def _ensure_sta() -> None:
     global _sta_started
     with _sta_lock:
@@ -156,3 +160,67 @@ def _show_save_dialog(initial_dir: Path, initial_filename: str) -> Path | None:
     if comdlg32.CommDlgExtendedError() == 0:
         return None
     raise OSError("保存ダイアログを開けませんでした")
+
+
+# BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_EDITBOX
+_BIF_FOLDER = 0x0001 | 0x0040 | 0x0010
+_BFFM_INITIALIZED = 1
+_BFFM_SETSELECTIONW = 0x0400 + 103
+
+_BrowseCallback = ctypes.WINFUNCTYPE(
+    ctypes.c_int, wintypes.HWND, ctypes.c_uint, wintypes.LPARAM, wintypes.LPARAM
+)
+
+
+def _on_browse(hwnd, msg, _lparam, data) -> int:
+    if msg == _BFFM_INITIALIZED and data:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        user32.SendMessageW.restype = wintypes.LPARAM
+        user32.SendMessageW(hwnd, _BFFM_SETSELECTIONW, 1, data)
+    return 0
+
+
+_browse_callback = _BrowseCallback(_on_browse)
+
+
+class BROWSEINFOW(ctypes.Structure):
+    _fields_ = [
+        ("hwndOwner", wintypes.HWND),
+        ("pidlRoot", ctypes.c_void_p),
+        ("pszDisplayName", wintypes.LPWSTR),
+        ("lpszTitle", wintypes.LPCWSTR),
+        ("ulFlags", wintypes.UINT),
+        ("lpfn", ctypes.c_void_p),
+        ("lParam", wintypes.LPARAM),
+        ("iImage", ctypes.c_int),
+    ]
+
+
+def _show_folder_dialog(initial_dir: Path) -> Path | None:
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    ole32 = ctypes.WinDLL("ole32", use_last_error=True)
+    shell32.SHBrowseForFolderW.argtypes = [ctypes.POINTER(BROWSEINFOW)]
+    shell32.SHBrowseForFolderW.restype = ctypes.c_void_p
+    shell32.SHGetPathFromIDListW.argtypes = [ctypes.c_void_p, wintypes.LPWSTR]
+    shell32.SHGetPathFromIDListW.restype = wintypes.BOOL
+    ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+
+    display = ctypes.create_unicode_buffer(260)
+    initial = ctypes.create_unicode_buffer(str(initial_dir))
+    info = BROWSEINFOW()
+    info.pszDisplayName = ctypes.cast(display, wintypes.LPWSTR)
+    info.lpszTitle = "分割した PDF の保存先フォルダ"
+    info.ulFlags = _BIF_FOLDER
+    info.lpfn = ctypes.cast(_browse_callback, ctypes.c_void_p)
+    info.lParam = ctypes.cast(initial, ctypes.c_void_p).value or 0
+    pidl = shell32.SHBrowseForFolderW(ctypes.byref(info))
+    if not pidl:
+        return None
+    try:
+        path_buffer = ctypes.create_unicode_buffer(32768)
+        if not shell32.SHGetPathFromIDListW(pidl, path_buffer):
+            return None
+        return Path(path_buffer.value)
+    finally:
+        ole32.CoTaskMemFree(pidl)

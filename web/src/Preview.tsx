@@ -291,6 +291,10 @@ export function ThumbnailStrip({
   onUnchangedReorder,
   onBlank,
   onColumns,
+  splitPositions,
+  onToggleSplit,
+  splitDisabled,
+  splitReason,
 }: {
   pdfs: Map<string, PDFDocumentProxy>;
   pages: PageRecord[];
@@ -306,6 +310,10 @@ export function ThumbnailStrip({
   onUnchangedReorder: () => void;
   onBlank: () => void;
   onColumns: (count: number) => void;
+  splitPositions: number[];
+  onToggleSplit: (afterPageId: string, present: boolean) => void;
+  splitDisabled?: boolean;
+  splitReason?: string;
 }) {
   const rootRef = useRef<HTMLDivElement>(null);
   const [root, setRoot] = useState<HTMLDivElement | null>(null);
@@ -509,10 +517,47 @@ export function ThumbnailStrip({
               return true;
             }}
           />
+          {index < pages.length - 1 ? (
+            <SplitMark
+              present={splitPositions.includes(index + 1)}
+              disabled={splitDisabled}
+              reason={splitReason}
+              onToggle={() => onToggleSplit(page.id, splitPositions.includes(index + 1))}
+            />
+          ) : null}
         </Fragment>
       ))}
       {dragSlot === pages.length ? <span className="drop-line" /> : null}
     </div>
+  );
+}
+
+function SplitMark({
+  present,
+  disabled,
+  reason,
+  onToggle,
+}: {
+  present: boolean;
+  disabled?: boolean;
+  reason?: string;
+  onToggle: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      className={present ? "split-line on" : "split-line"}
+      aria-pressed={present}
+      aria-label={present ? "分割線を外す" : "分割線を入れる"}
+      disabled={disabled}
+      title={disabled ? reason : present ? "この分割線を外します" : "ここに分割線を入れます"}
+      onPointerDown={(event) => event.stopPropagation()}
+      onClick={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        onToggle();
+      }}
+    />
   );
 }
 

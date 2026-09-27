@@ -12,6 +12,10 @@ import {
   postDocument,
   postExport,
   postPassword,
+  postSelectionExport,
+  postSplit,
+  postSplitCancel,
+  postSplitConfirm,
   putSettings,
   readToken,
 } from "./api";
@@ -59,6 +63,8 @@ const emptySession: SessionState = {
   undo_hint: "元に戻せる操作がありません。実行しても状態は変わりません",
   redo_hint: "やり直せる操作がありません。実行しても状態は変わりません",
   unsaved: false,
+  split_positions: [],
+  split_unexported: false,
 };
 
 const defaultSettings: ViewSettings = {
@@ -69,6 +75,17 @@ const defaultSettings: ViewSettings = {
 
 const selectPrompt = "ページを選択してください";
 const noPageReason = "ページが選択されていないため使えません。ページを選択すると使えます。";
+const noVisibleReason = "見えているページがないため書き出せません。";
+const noSplitReason = "分割線が無いため使えません。分割線があるときに使えます。";
+
+type SavedResult =
+  | { kind: "single"; jobId: string; path: string }
+  | { kind: "split"; jobId: string; files: string[] };
+
+type NamingState = {
+  names: string[];
+  counts: number[];
+};
 
 function fileNameOf(path: string): string {
   const parts = path.split(/[/\\]/);
@@ -253,6 +270,59 @@ function ConfirmDialog({
   );
 }
 
+function SplitNamingDialog({
+  names,
+  counts,
+  error,
+  busy,
+  onChange,
+  onConfirm,
+  onCancel,
+}: {
+  names: string[];
+  counts: number[];
+  error: string | null;
+  busy: boolean;
+  onChange: (index: number, value: string) => void;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div className="modal-backdrop">
+      <form
+        className="modal"
+        onSubmit={(event) => {
+          event.preventDefault();
+          onConfirm();
+        }}
+      >
+        <p>分割した PDF のファイル名を確認してから書き出します。</p>
+        {names.map((name, index) => (
+          <label className="name-row" key={index}>
+            <span>
+              {index + 1} 件目（{counts[index]} ページ）
+            </span>
+            <input
+              aria-label={`${index + 1}件目のファイル名`}
+              value={name}
+              onChange={(event) => onChange(index, event.target.value)}
+            />
+          </label>
+        ))}
+        {error ? <p className="modal-error">{error}</p> : null}
+        <div className="modal-actions">
+          <button type="submit" disabled={busy}>
+            書き出す
+          </button>
+          <button type="button" onClick={onCancel} disabled={busy}>
+            取り消し
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
 function TipButton({
   label,
   disabled,
@@ -288,7 +358,9 @@ export function App() {
   const [dialog, setDialog] = useState<DialogState | null>(null);
   const [waiting, setWaiting] = useState<string | null>(null);
   const [progress, setProgress] = useState<ExportJob | null>(null);
-  const [saved, setSaved] = useState<{ jobId: string; path: string } | null>(null);
+  const [saved, setSaved] = useState<SavedResult | null>(null);
+  const [naming, setNaming] = useState<NamingState | null>(null);
+  const [namingError, setNamingError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [jumpText, setJumpText] = useState("");
   const [moveText, setMoveText] = useState("");
@@ -312,6 +384,17 @@ export function App() {
   const loadingRef = useRef(false);
   const abortRef = useRef(false);
   const dialogRef = useRef<DialogState | null>(null);
+  const namingRef = useRef<NamingState | null>(null);
+  const mountedRef = useRef(true);
+  const exportMenuRef = useRef<HTMLDetailsElement>(null);
+  const splitGate = useRef<{ promise: Promise<void>; resolve: () => void } | null>(null);
+  if (splitGate.current === null) {
+    let resolve = () => {};
+    const promise = new Promise<void>((done) => {
+      resolve = done;
+    });
+    splitGate.current = { promise, resolve };
+  }
   const pendingDialog = useRef<((answer: DialogAnswer) => void) | null>(null);
   const pdfsRef = useRef<Map<string, PDFDocumentProxy>>(new Map());
   const toastTimer = useRef(0);
@@ -323,6 +406,7 @@ export function App() {
   busyRef.current = busy;
   loadingRef.current = loading;
   dialogRef.current = dialog;
+  namingRef.current = naming;
 
   const pages = visiblePages(session.pages);
   const names = useMemo(
@@ -341,6 +425,20 @@ export function App() {
   const onColumns = useCallback((count: number) => {
     setColumns(count);
   }, []);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    let live = true;
+    postSplitCancel(token).finally(() => {
+      if (live) {
+        splitGate.current?.resolve();
+      }
+    });
+    return () => {
+      live = false;
+      mountedRef.current = false;
+    };
+  }, [token]);
 
   useEffect(() => {
     let activeRequest = true;
@@ -472,7 +570,7 @@ export function App() {
   }
 
   async function runCommand(command: EditCommand) {
-    if (busyRef.current) {
+    if (busyRef.current || namingRef.current) {
       return;
     }
     setRemovedCount(null);
@@ -537,7 +635,7 @@ export function App() {
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if (dialogRef.current) {
+      if (dialogRef.current || namingRef.current) {
         if (event.key === "Escape") {
           event.preventDefault();
         }
@@ -844,18 +942,46 @@ export function App() {
     void addFiles([...event.dataTransfer.files]);
   }
 
-  async function openResult(kind: "open-file" | "open-folder") {
+  async function openResult(kind: "open-file" | "open-folder", index?: number) {
     if (!saved) {
       return;
     }
     try {
-      await openSaved(token, saved.jobId, kind);
+      await openSaved(token, saved.jobId, kind, index);
     } catch (reason: unknown) {
       setError(reason instanceof Error ? reason.message : "開けませんでした");
     }
   }
 
+  async function watchExport(jobId: string, kind: "single" | "split") {
+    let job = await getExportJob(token, jobId);
+    setProgress(job);
+    setWaiting(null);
+    while (job.stage !== "completed" && job.stage !== "failed") {
+      await delay(300);
+      job = await getExportJob(token, jobId);
+      setProgress(job);
+    }
+    if (job.stage === "failed") {
+      setError(job.detail ?? "書き出しに失敗しました");
+      return;
+    }
+    const latest = await getSession(token);
+    setSession(latest);
+    anchorRef.current = latest.active_page_id;
+    if (kind === "split") {
+      setSaved({ kind: "split", jobId, files: job.files ?? [] });
+      return;
+    }
+    if (job.path) {
+      setSaved({ kind: "single", jobId, path: job.path });
+    }
+  }
+
   async function exportAll() {
+    if (namingRef.current) {
+      return;
+    }
     setBusy(true);
     setError(null);
     setSaved(null);
@@ -867,27 +993,121 @@ export function App() {
         setWaiting(null);
         return;
       }
-      let job = await getExportJob(token, started.job_id);
-      setProgress(job);
-      setWaiting(null);
-      while (job.stage !== "completed" && job.stage !== "failed") {
-        await delay(300);
-        job = await getExportJob(token, started.job_id);
-        setProgress(job);
-      }
-      if (job.stage === "failed") {
-        setError(job.detail ?? "書き出しに失敗しました");
-        return;
-      }
-      const latest = await getSession(token);
-      setSession(latest);
-      anchorRef.current = latest.active_page_id;
-      if (job.path) {
-        setSaved({ jobId: job.job_id, path: job.path });
-      }
+      await watchExport(started.job_id, "single");
     } catch (reason: unknown) {
       setWaiting(null);
       setError(reason instanceof Error ? reason.message : "書き出せませんでした");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function exportSelection() {
+    if (namingRef.current) {
+      return;
+    }
+    closeExportMenu();
+    setBusy(true);
+    setError(null);
+    setSaved(null);
+    setProgress(null);
+    setWaiting("保存先を選択しています");
+    try {
+      const started = await postSelectionExport(token);
+      if ("status" in started) {
+        setWaiting(null);
+        return;
+      }
+      await watchExport(started.job_id, "single");
+    } catch (reason: unknown) {
+      setWaiting(null);
+      setError(reason instanceof Error ? reason.message : "書き出せませんでした");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function closeExportMenu() {
+    if (exportMenuRef.current) {
+      exportMenuRef.current.open = false;
+    }
+  }
+
+  async function exportSplit() {
+    if (namingRef.current) {
+      return;
+    }
+    closeExportMenu();
+    await splitGate.current?.promise;
+    if (!mountedRef.current || namingRef.current) {
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setSaved(null);
+    setProgress(null);
+    setWaiting("保存先フォルダを選択しています");
+    try {
+      const started = await postSplit(token);
+      if (!mountedRef.current) {
+        await postSplitCancel(token);
+        return;
+      }
+      if (started.status === "cancelled") {
+        setWaiting(null);
+        return;
+      }
+      setNaming({
+        names: started.files.map((file) => file.name),
+        counts: started.files.map((file) => file.pages),
+      });
+      setNamingError(null);
+      setWaiting(null);
+    } catch (reason: unknown) {
+      setWaiting(null);
+      if (mountedRef.current) {
+        setError(reason instanceof Error ? reason.message : "書き出せませんでした");
+      } else {
+        await postSplitCancel(token);
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function confirmSplitNames() {
+    if (!naming) {
+      return;
+    }
+    setBusy(true);
+    setNamingError(null);
+    setError(null);
+    setSaved(null);
+    setProgress(null);
+    try {
+      const started = await postSplitConfirm(token, naming.names);
+      setNaming(null);
+      await watchExport(started.job_id, "split");
+    } catch (reason: unknown) {
+      if (reason instanceof ApiError && reason.status === 400) {
+        setNamingError(reason.message);
+        return;
+      }
+      setError(reason instanceof Error ? reason.message : "書き出せませんでした");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function cancelSplitNames() {
+    setBusy(true);
+    try {
+      await postSplitCancel(token);
+      setNaming(null);
+      setNamingError(null);
+      setWaiting(null);
+    } catch (reason: unknown) {
+      setError(reason instanceof Error ? reason.message : "取り消しできませんでした");
     } finally {
       setBusy(false);
     }
@@ -990,7 +1210,16 @@ export function App() {
       ? "400%より大きくできないため使えません。400%より小さい表示のときに使えます。"
       : undefined;
 
-  const editLocked = busy ? "書き出し中は編集できません。" : undefined;
+  const editLocked = busy
+    ? "書き出し中は編集できません。"
+    : naming
+      ? "ファイル名の入力中は編集できません。"
+      : undefined;
+  const exportLocked = pages.length === 0 || busy || loading || naming !== null;
+  const exportReason = pages.length === 0 ? noVisibleReason : editLocked;
+  const selectionExportReason =
+    exportReason ?? (session.selected_page_ids.length === 0 ? noPageReason : undefined);
+  const clearSplitsReason = editLocked ?? (session.split_positions.length === 0 ? noSplitReason : undefined);
   const selectionReason = editLocked ?? (session.selected_page_ids.length === 0 ? noPageReason : undefined);
   const emptyMessage =
     pages.length === 0
@@ -1163,25 +1392,56 @@ export function App() {
           reason="設定の読み込みが終わると使えます。"
           onClick={() => chooseSize("large")}
         />
+        <TipButton
+          label="すべての分割線を解除"
+          disabled={clearSplitsReason !== undefined}
+          reason={clearSplitsReason}
+          onClick={() => void runCommand({ type: "clear_all_splits" })}
+        />
         {session.unsaved ? (
-          <button
-            type="button"
-            disabled={pages.length === 0 || busy || loading}
-            title={pages.length === 0 ? "見えているページがないため書き出せません。" : undefined}
-            onClick={() => void exportAll()}
-          >
+          <button type="button" disabled={exportLocked} title={exportReason} onClick={() => void exportAll()}>
             未保存
+          </button>
+        ) : null}
+        {session.split_unexported ? (
+          <button type="button" disabled={exportLocked} title={exportReason} onClick={() => void exportSplit()}>
+            分割設定 未出力
           </button>
         ) : null}
         <button
           type="button"
           className="export-button"
-          disabled={pages.length === 0 || busy || loading}
-          title={pages.length === 0 ? "見えているページがないため書き出せません。" : undefined}
+          disabled={exportLocked}
+          title={exportReason}
           onClick={() => void exportAll()}
         >
           全ページを書き出す
         </button>
+        <details className="export-menu" ref={exportMenuRef}>
+          <summary
+            onClick={(event) => {
+              if (exportLocked) {
+                event.preventDefault();
+              }
+            }}
+          >
+            分割・選択ページ
+          </summary>
+          <div className="menu-panel">
+            <TipButton
+              label="分割"
+              disabled={exportLocked}
+              reason={exportReason}
+              onClick={() => void exportSplit()}
+            />
+            <TipButton
+              label="選択ページ"
+              disabled={selectionExportReason !== undefined}
+              reason={selectionExportReason}
+              onClick={() => void exportSelection()}
+            />
+          </div>
+        </details>
         <form className="jump" onSubmit={(event) => void jump(event)}>
           <input
             aria-label="ページ番号"
@@ -1219,13 +1479,29 @@ export function App() {
           {Math.round(progress.ratio * 100)}%）
         </p>
       ) : null}
-      {saved ? (
+      {saved?.kind === "single" ? (
         <div className="result">
           <span>ファイル名 {fileNameOf(saved.path)}</span>
           <span>保存先 {directoryOf(saved.path)}</span>
           <button type="button" onClick={() => void openResult("open-file")}>
             PDF を開く
           </button>
+          <button type="button" onClick={() => void openResult("open-folder")}>
+            保存先を開く
+          </button>
+        </div>
+      ) : null}
+      {saved?.kind === "split" ? (
+        <div className="result">
+          {saved.files.map((path, index) => (
+            <span key={`${path}-${index}`}>
+              ファイル名 {fileNameOf(path)}
+              <button type="button" onClick={() => void openResult("open-file", index)}>
+                PDF を開く
+              </button>
+            </span>
+          ))}
+          {saved.files[0] ? <span>保存先 {directoryOf(saved.files[0])}</span> : null}
           <button type="button" onClick={() => void openResult("open-folder")}>
             保存先を開く
           </button>
@@ -1272,6 +1548,16 @@ export function App() {
               onUnchangedReorder={() => showToast("並びは変わっていません")}
               onBlank={() => void applySelection(clearSelection())}
               onColumns={onColumns}
+              splitPositions={session.split_positions}
+              splitDisabled={editLocked !== undefined}
+              splitReason={editLocked}
+              onToggleSplit={(pageId, present) =>
+                void runCommand(
+                  present
+                    ? { type: "clear_split", after_page_id: pageId }
+                    : { type: "set_split", after_page_id: pageId },
+                )
+              }
             />
           ) : null}
         </section>
@@ -1283,6 +1569,26 @@ export function App() {
           error={dialog.error}
           onSubmit={(password) => submitPasswordDialog(dialog.documentId, password)}
           onCancel={() => finishDialog("cancel")}
+        />
+      ) : null}
+      {naming ? (
+        <SplitNamingDialog
+          names={naming.names}
+          counts={naming.counts}
+          error={namingError}
+          busy={busy}
+          onChange={(index, value) => {
+            setNaming((current) => {
+              if (!current) {
+                return current;
+              }
+              const names = current.names.slice();
+              names[index] = value;
+              return { ...current, names };
+            });
+          }}
+          onConfirm={() => void confirmSplitNames()}
+          onCancel={() => void cancelSplitNames()}
         />
       ) : null}
       {dialog?.kind === "confirm" ? (

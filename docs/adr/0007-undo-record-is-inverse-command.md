@@ -17,3 +17,4 @@ status: accepted
 - Undo のあとで新しい編集をしたら、Redo は捨てる。
 - 戻したあとの選択は、その1件が持つ識別子で復元する。
 - 上限は 100 件である。超えたときは古いものから捨て、最初の破棄のときだけ通知する。
+- 削除の Undo は、逆コマンド `restore_deleted` が削除直前の `split_positions` を持つ。末尾追加の Undo 記録は、逆コマンド `remove_documents` とは別に、その `remove_documents` を適用する直前の `split_positions` を持つ。Redo はその位置を、ページを戻したあとに書き戻す。PDF のコピーは持たない。
