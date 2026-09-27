@@ -28,9 +28,22 @@ export function readToken(): string {
   return content;
 }
 
+const TAB_KEY = "pdf-editor-tab-id";
+
+export function tabId(): string {
+  const existing = sessionStorage.getItem(TAB_KEY);
+  if (existing) {
+    return existing;
+  }
+  const created = crypto.randomUUID();
+  sessionStorage.setItem(TAB_KEY, created);
+  return created;
+}
+
 async function request(token: string, path: string, init?: RequestInit): Promise<Response> {
   const headers = new Headers(init?.headers);
   headers.set("Authorization", `Bearer ${token}`);
+  headers.set("X-Tab-Id", tabId());
   return fetch(path, { ...init, headers });
 }
 
@@ -88,8 +101,45 @@ export function postDuplicate(
   }).then((response) => readJson<{ duplicate: boolean }>(response));
 }
 
-export function getAbout(token: string): Promise<{ name: string; version: string }> {
-  return request(token, "/api/about").then((response) => readJson<{ name: string; version: string }>(response));
+export function getAbout(token: string): Promise<{ name: string; version: string; cleared_leftover: boolean }> {
+  return request(token, "/api/about").then((response) =>
+    readJson<{ name: string; version: string; cleared_leftover: boolean }>(response),
+  );
+}
+
+export function postClaim(token: string): Promise<Record<string, never>> {
+  return request(token, "/api/editor/claim", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ tab_id: tabId() }),
+  }).then((response) => readJson<Record<string, never>>(response));
+}
+
+export function postHeartbeat(token: string): Promise<{ idle_warning: boolean }> {
+  return request(token, "/api/editor/heartbeat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ tab_id: tabId() }),
+  }).then((response) => readJson<{ idle_warning: boolean }>(response));
+}
+
+export function postActivity(
+  token: string,
+  source: "click" | "key" | "scroll" | "settings" | "continue",
+): Promise<{ reset: boolean }> {
+  return request(token, "/api/activity", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ source }),
+  }).then((response) => readJson<{ reset: boolean }>(response));
+}
+
+export function postShutdown(token: string, confirmed: boolean): Promise<{ stopped: boolean }> {
+  return request(token, "/api/shutdown", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ confirmed }),
+  }).then((response) => readJson<{ stopped: boolean }>(response));
 }
 
 export function postLogsOpen(token: string): Promise<{ status: string }> {

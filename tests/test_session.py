@@ -82,11 +82,47 @@ def env(tmp_path):
     session = Session(temp_dir=tmp_path / "pdf-editor")
     app = create_app(session, settings_path=tmp_path / "settings.json")
     with TestClient(app) as client:
+        claim_tab(client, app)
         yield client, app, session
 
 
 def auth(app) -> dict[str, str]:
-    return {"Authorization": f"Bearer {app.state.token}"}
+    tab_id = app.state.editor_tab_id
+    if not isinstance(tab_id, str):
+        raise RuntimeError("編集権の claim がテストの共通セットアップにありません")
+    return {"Authorization": f"Bearer {app.state.token}", "X-Tab-Id": tab_id}
+
+
+def tab_headers(app, tab_id: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {app.state.token}", "X-Tab-Id": tab_id}
+
+
+def claim_tab(client: TestClient, app, tab_id: str = "tab-a", *, adopt: bool = True):
+    if adopt:
+        app.state.editor_tab_id = tab_id
+    response = client.post(
+        "/api/editor/claim",
+        headers=tab_headers(app, tab_id),
+        json={"tab_id": tab_id},
+    )
+    assert response.status_code == 200, response.text
+    return response
+
+
+def release_tab(client: TestClient, app, tab_id: str):
+    return client.post(
+        "/api/editor/release",
+        headers=tab_headers(app, tab_id),
+        json={"tab_id": tab_id},
+    )
+
+
+def heartbeat_tab(client: TestClient, app, tab_id: str):
+    return client.post(
+        "/api/editor/heartbeat",
+        headers=tab_headers(app, tab_id),
+        json={"tab_id": tab_id},
+    )
 
 
 INTAKE_KEYS = {"document_id", "needs_password", "byte_size", "page_count", "signed", "duplicate"}
@@ -1967,3 +2003,326 @@ def test_second_reset_conflicts_until_the_first_finishes(env, tmp_path):
     assert result["response"].json()["unsaved"] is False
     assert list(session.temp_dir.iterdir()) == []
     assert post_reset(client, app).status_code == 200
+
+
+SECOND_TAB = "編集画面は別のタブで開いています。このタブでは編集できません。開いているタブに戻ってください。"
+
+
+def _timed_app(tmp_path, now: list[float], stopped: list[str]):
+    session = Session(temp_dir=tmp_path / "pdf-editor")
+    app = create_app(
+        session,
+        settings_path=tmp_path / "settings.json",
+        clock=lambda: now[0],
+        stop=lambda: stopped.append("stop"),
+    )
+    return session, app
+
+
+def test_one_tab_holds_the_editor_and_reclaim_keeps_it(tmp_path):
+    now = [10.0]
+    _session, app = _timed_app(tmp_path, now, [])
+    with TestClient(app) as client:
+        source = tmp_path / "sample.pdf"
+        write_pdf(source, pages=1)
+        claimed = claim_tab(client, app, "tab-a")
+        assert "documents" not in claimed.json()
+        assert "pages" not in claimed.json()
+        loaded = load_pdf(client, app, source)
+        assert client.get("/api/session", headers=auth(app)).status_code == 200
+
+        blocked = client.post("/api/editor/claim", headers=tab_headers(app, "tab-b"), json={"tab_id": "tab-b"})
+        assert blocked.status_code == 409
+        assert blocked.json() == {"detail": SECOND_TAB}
+        denied = client.get("/api/session", headers=tab_headers(app, "tab-b"))
+        assert denied.status_code == 409
+        assert denied.json() == {"detail": SECOND_TAB}
+        missing = client.get("/api/session", headers={"Authorization": f"Bearer {app.state.token}"})
+        assert missing.status_code == 409
+        assert missing.json() == {"detail": SECOND_TAB}
+
+        again = claim_tab(client, app, "tab-a")
+        assert again.json() == {}
+        restored = client.get("/api/session", headers=auth(app)).json()
+        assert restored["documents"] == loaded["documents"]
+
+        now[0] += 4
+        claim_tab(client, app, "tab-a")
+        still = client.post("/api/editor/claim", headers=tab_headers(app, "tab-b"), json={"tab_id": "tab-b"})
+        assert still.status_code == 409
+
+        ignored = release_tab(client, app, "tab-b")
+        assert ignored.status_code == 200
+        assert client.post("/api/editor/claim", headers=tab_headers(app, "tab-b"), json={"tab_id": "tab-b"}).status_code == 409
+
+        assert release_tab(client, app, "tab-a").status_code == 200
+        claim_tab(client, app, "tab-b")
+        handed = client.get("/api/session", headers=tab_headers(app, "tab-b"))
+        assert handed.status_code == 200
+        assert handed.json()["documents"] == loaded["documents"]
+
+
+def test_heartbeat_silence_releases_the_editor_without_a_client_timer(tmp_path):
+    now = [0.0]
+    _session, app = _timed_app(tmp_path, now, [])
+    with TestClient(app) as client:
+        claim_tab(client, app, "tab-a")
+        assert heartbeat_tab(client, app, "tab-b").status_code == 200
+        assert heartbeat_tab(client, app, "tab-b").json()["idle_warning"] is False
+        now[0] += 5.1
+        claim_tab(client, app, "tab-b")
+        assert client.get("/api/session", headers=tab_headers(app, "tab-a")).status_code == 409
+        assert client.get("/api/session", headers=tab_headers(app, "tab-b")).status_code == 200
+
+
+def test_claim_rejects_a_tab_id_that_does_not_match_the_header(tmp_path):
+    session = Session(temp_dir=tmp_path / "pdf-editor")
+    app = create_app(session, settings_path=tmp_path / "settings.json")
+    with TestClient(app) as client:
+        mismatch = client.post(
+            "/api/editor/claim",
+            headers=tab_headers(app, "tab-a"),
+            json={"tab_id": "tab-b"},
+        )
+        missing_header = client.post(
+            "/api/editor/claim",
+            headers={"Authorization": f"Bearer {app.state.token}"},
+            json={"tab_id": "tab-a"},
+        )
+        missing_body = client.post(
+            "/api/editor/claim",
+            headers=tab_headers(app, "tab-a"),
+            json={},
+        )
+        assert mismatch.status_code == 400
+        assert missing_header.status_code == 400
+        assert missing_body.status_code == 400
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("GET", "/api/session"),
+        ("GET", "/api/session/file"),
+        ("GET", "/api/session/files/missing"),
+        ("POST", "/api/exports/all"),
+        ("GET", "/api/exports/missing"),
+        ("POST", "/api/dialogs/open-pdfs"),
+        ("GET", "/api/settings"),
+        ("PUT", "/api/settings"),
+        ("POST", "/api/activity"),
+        ("GET", "/api/about"),
+        ("POST", "/api/shutdown"),
+    ],
+)
+def test_editor_routes_reject_a_tab_that_does_not_hold_the_lease(env, method, path):
+    client, app, _session = env
+    missing = client.request(method, path, headers={"Authorization": f"Bearer {app.state.token}"})
+    other = client.request(method, path, headers=tab_headers(app, "tab-b"))
+    assert missing.status_code == 409
+    assert missing.json() == {"detail": SECOND_TAB}
+    assert other.status_code == 409
+    assert other.json() == {"detail": SECOND_TAB}
+    assert "documents" not in missing.json()
+    assert "pages" not in missing.json()
+
+
+def test_editor_open_is_not_an_editor_lease_conflict(env):
+    client, app, _session = env
+    opened = client.post("/api/editor/open", headers={"Authorization": f"Bearer {app.state.token}"})
+    anonymous = client.post("/api/editor/open")
+    assert opened.status_code == 404
+    assert anonymous.status_code == 401
+
+
+def test_leftover_temp_files_are_cleared_once(tmp_path):
+    temp = tmp_path / "pdf-editor"
+    temp.mkdir()
+    (temp / "left.pdf").write_bytes(b"old")
+    session = Session(temp_dir=temp)
+    app = create_app(session, settings_path=tmp_path / "settings.json")
+    with TestClient(app) as client:
+        claim_tab(client, app)
+        about = client.get("/api/about", headers=auth(app))
+        assert about.status_code == 200
+        assert about.json()["cleared_leftover"] is True
+        assert not (temp / "left.pdf").exists()
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    empty_session = Session(temp_dir=empty)
+    empty_app = create_app(empty_session, settings_path=tmp_path / "empty-settings.json")
+    with TestClient(empty_app) as client:
+        claim_tab(client, empty_app)
+        assert client.get("/api/about", headers=auth(empty_app)).json()["cleared_leftover"] is False
+        assert empty.is_dir()
+
+    missing = tmp_path / "missing"
+    missing_session = Session(temp_dir=missing)
+    missing_app = create_app(missing_session, settings_path=tmp_path / "missing-settings.json")
+    with TestClient(missing_app) as client:
+        claim_tab(client, missing_app)
+        assert client.get("/api/about", headers=auth(missing_app)).json()["cleared_leftover"] is False
+
+
+def test_activity_restarts_idle_and_mouse_movement_does_not(tmp_path):
+    now = [0.0]
+    stopped: list[str] = []
+    _session, app = _timed_app(tmp_path, now, stopped)
+    with TestClient(app) as client:
+        claim_tab(client, app)
+        saved = client.put(
+            "/api/settings",
+            headers=auth(app),
+            json={
+                "thumbnail_layout": "row",
+                "thumbnail_size": "medium",
+                "pane_ratio": None,
+                "theme": None,
+                "windows_notifications": True,
+                "idle_minutes": 30,
+            },
+        )
+        assert saved.status_code == 200
+        assert client.post("/api/activity", headers=auth(app), json={"source": "settings"}).json()["reset"] is True
+
+        now[0] = 1739
+        claim_tab(client, app)
+        assert heartbeat_tab(client, app, "tab-a").json()["idle_warning"] is False
+        assert "idle_warning" not in client.get("/api/session", headers=auth(app)).json()
+        now[0] = 1740
+        claim_tab(client, app)
+        assert heartbeat_tab(client, app, "tab-a").json()["idle_warning"] is True
+        assert client.get("/api/session", headers=auth(app)).json()["idle_warning"] is True
+
+        for source in ("click", "key", "scroll", "settings", "continue"):
+            reset = client.post("/api/activity", headers=auth(app), json={"source": source})
+            assert reset.status_code == 200
+            assert reset.json()["reset"] is True
+            assert heartbeat_tab(client, app, "tab-a").json()["idle_warning"] is False
+            now[0] += 1740
+            claim_tab(client, app)
+            assert heartbeat_tab(client, app, "tab-a").json()["idle_warning"] is True
+
+        mouse = client.post("/api/activity", headers=auth(app), json={"source": "mousemove"})
+        assert mouse.status_code == 200
+        assert mouse.json()["reset"] is False
+        assert heartbeat_tab(client, app, "tab-a").json()["idle_warning"] is True
+        assert stopped == []
+
+
+def test_idle_runs_without_an_editor_and_stops_without_another_confirm(tmp_path):
+    now = [0.0]
+    stopped: list[str] = []
+    session, app = _timed_app(tmp_path, now, stopped)
+    with TestClient(app) as client:
+        claim_tab(client, app)
+        source = tmp_path / "sample.pdf"
+        write_pdf(source, pages=1)
+        loaded = load_pdf(client, app, source)
+        page_id = loaded["pages"][0]["id"]
+        rotated = post_command(client, app, {"type": "rotate", "page_ids": [page_id], "direction": "right"})
+        assert rotated.json()["unsaved"] is True
+        (session.temp_dir / "keep.pdf").write_bytes(b"keep")
+        now[0] = 120 * 60
+        app.state.idle.tick()
+        assert stopped == ["stop"]
+        assert not session.temp_dir.exists()
+
+
+def test_export_pauses_idle_until_it_finishes(tmp_path):
+    now = [0.0]
+    stopped: list[str] = []
+    session, app = _timed_app(tmp_path, now, stopped)
+    with TestClient(app) as client:
+        claim_tab(client, app)
+        source = tmp_path / "sample.pdf"
+        write_pdf(source, pages=1)
+        load_pdf(client, app, source)
+        now[0] = 3
+        destination = tmp_path / "out"
+        destination.mkdir()
+        app.state.exporter.ask_save_path = lambda _directory, _name: destination / "out.pdf"
+        started = threading.Event()
+        release = threading.Event()
+
+        def pause() -> None:
+            started.set()
+            assert release.wait(5)
+
+        app.state.exporter.pause_during_copy = pause
+        response = client.post("/api/exports/all", headers=auth(app))
+        assert response.status_code == 200, response.text
+        assert started.wait(5)
+        frozen = app.state.idle.remaining()
+        now[0] += 8000
+        app.state.idle.tick()
+        assert stopped == []
+        assert app.state.idle.remaining() == frozen
+        release.set()
+        for _ in range(50):
+            if session.current_activity() is not Activity.EXPORTING:
+                break
+            time.sleep(0.05)
+        assert session.current_activity() is not Activity.EXPORTING
+        assert app.state.idle.remaining() == frozen
+        now[0] += frozen
+        app.state.idle.tick()
+        assert stopped == ["stop"]
+        assert not session.temp_dir.exists()
+
+
+def test_shutdown_confirms_only_when_work_would_be_lost(tmp_path):
+    stopped: list[str] = []
+    session = Session(temp_dir=tmp_path / "pdf-editor")
+    app = create_app(session, settings_path=tmp_path / "settings.json", stop=lambda: stopped.append("stop"))
+    with TestClient(app) as client:
+        claim_tab(client, app)
+        source = tmp_path / "sample.pdf"
+        write_pdf(source, pages=2)
+        load_pdf(client, app, source)
+        clean = client.post("/api/shutdown", headers=auth(app), json={})
+        assert clean.status_code == 200
+        assert clean.json()["stopped"] is True
+        assert stopped == ["stop"]
+        assert not session.temp_dir.exists()
+
+    stopped.clear()
+    session = Session(temp_dir=tmp_path / "dirty")
+    app = create_app(session, settings_path=tmp_path / "dirty-settings.json", stop=lambda: stopped.append("stop"))
+    with TestClient(app) as client:
+        claim_tab(client, app)
+        source = tmp_path / "dirty.pdf"
+        write_pdf(source, pages=2)
+        loaded = load_pdf(client, app, source)
+        page_id = loaded["pages"][0]["id"]
+        rotated = post_command(client, app, {"type": "rotate", "page_ids": [page_id], "direction": "right"})
+        assert rotated.json()["unsaved"] is True
+        cancelled = client.post("/api/shutdown", headers=auth(app), json={"confirmed": False})
+        assert cancelled.json() == {"stopped": False}
+        assert stopped == []
+        assert client.get("/api/session", headers=auth(app)).status_code == 200
+        assert session.temp_dir.exists()
+        confirmed = client.post("/api/shutdown", headers=auth(app), json={"confirmed": True})
+        assert confirmed.json()["stopped"] is True
+        assert stopped == ["stop"]
+        assert not session.temp_dir.exists()
+
+    stopped.clear()
+    session = Session(temp_dir=tmp_path / "split")
+    app = create_app(session, settings_path=tmp_path / "split-settings.json", stop=lambda: stopped.append("stop"))
+    with TestClient(app) as client:
+        claim_tab(client, app)
+        source = tmp_path / "split.pdf"
+        write_pdf(source, pages=2)
+        loaded = load_pdf(client, app, source)
+        ids = [page["id"] for page in loaded["pages"]]
+        placed = post_command(client, app, {"type": "set_split", "after_page_id": ids[0]})
+        assert placed.json()["split_unexported"] is True
+        assert placed.json()["unsaved"] is False
+        cancelled = client.post("/api/shutdown", headers=auth(app), json={"confirmed": False})
+        assert cancelled.json()["stopped"] is False
+        assert stopped == []
+        confirmed = client.post("/api/shutdown", headers=auth(app), json={"confirmed": True})
+        assert confirmed.json()["stopped"] is True
+        assert stopped == ["stop"]

@@ -1,12 +1,13 @@
 import { getDocument, GlobalWorkerOptions, type PDFDocumentProxy, type RenderTask } from "pdfjs-dist";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+import { tabId } from "./api";
 
 GlobalWorkerOptions.workerSrc = workerUrl;
 
 export function openDocumentPdf(token: string, documentId: string): Promise<PDFDocumentProxy> {
   return getDocument({
     url: `/api/session/files/${documentId}`,
-    httpHeaders: { Authorization: `Bearer ${token}` },
+    httpHeaders: { Authorization: `Bearer ${token}`, "X-Tab-Id": tabId() },
     disableStream: true,
     disableAutoFetch: true,
   }).promise;

@@ -9,16 +9,20 @@ import {
   getSettings,
   openSaved,
   patchSelection,
+  postActivity,
+  postClaim,
   postCommand,
   postDocument,
   postDuplicate,
   postExport,
+  postHeartbeat,
   postLogsOpen,
   postOpenPdfs,
   postPassword,
   postSelectionExport,
   postSessionReset,
   postSettingsReset,
+  postShutdown,
   postSplit,
   postSplitCancel,
   postSplitConfirm,
@@ -121,6 +125,37 @@ function viewFromPath(pathname: string): AppView {
 
 function isOpened(item: OpenedDocument | RejectedDocument): item is OpenedDocument {
   return "document_id" in item;
+}
+
+const SECOND_TAB_MESSAGE =
+  "編集画面は別のタブで開いています。このタブでは編集できません。開いているタブに戻ってください。";
+const UNSUPPORTED_BROWSER =
+  "このブラウザは正式な対応対象ではありません。Microsoft Edge または Google Chrome を推奨します。このまま使うこともできます。";
+const LEFTOVER_MESSAGE = "前回の終了が完了しなかったため、一時データを消去しました。";
+const OFFLINE_MESSAGE = "バックエンドに届かないため、編集状態は表示しません。";
+
+type Access = "pending" | "editing" | "blocked" | "offline";
+
+function unsupportedBrowser(ua: string): string | null {
+  const edge = ua.includes("Edg/");
+  const chrome = ua.includes("Chrome/") && !ua.includes("Edg/") && !ua.includes("OPR/");
+  if (edge || chrome) {
+    return null;
+  }
+  return UNSUPPORTED_BROWSER;
+}
+
+function idleLossText(current: { unsaved: boolean; split_unexported: boolean }): string {
+  if (current.unsaved && current.split_unexported) {
+    return "未保存の変更と、まだ書き出していない分割設定があります。";
+  }
+  if (current.unsaved) {
+    return "未保存の変更があります。";
+  }
+  if (current.split_unexported) {
+    return "まだ書き出していない分割設定があります。";
+  }
+  return "";
 }
 
 function startFreshConfirmMessage(current: { unsaved: boolean; split_unexported: boolean }): string | null {
@@ -417,6 +452,7 @@ function Icon({ name }: { name: string }) {
       {name === "row" ? <path {...common} d="M4 8h4v8H4zM10 8h4v8h-4zM16 8h4v8h-4z" /> : null}
       {name === "grid" ? <path {...common} d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z" /> : null}
       {name === "export" ? <path {...common} d="M12 4v10M8 10l4 4 4-4M5 20h14" /> : null}
+      {name === "exit" ? <path {...common} d="M10 7V5H5v14h5v-2M10 12h10M16 8l4 4-4 4" /> : null}
     </svg>
   );
 }
@@ -554,13 +590,18 @@ function HelpScreen() {
 
 export function App() {
   const token = useMemo(() => readToken(), []);
+  const [access, setAccess] = useState<Access>("pending");
+  const [browserNotice, setBrowserNotice] = useState<string | null>(() => unsupportedBrowser(navigator.userAgent));
+  const [leftoverNotice, setLeftoverNotice] = useState(false);
+  const [idleWarning, setIdleWarning] = useState(false);
+  const [warningDismissed, setWarningDismissed] = useState(false);
   const [session, setSession] = useState<SessionState>(emptySession);
   const [settings, setSettings] = useState<ViewSettings>(defaultSettings);
   const [settingsReady, setSettingsReady] = useState(false);
   const [view, setView] = useState<AppView>(() => viewFromPath(window.location.pathname));
   const [picking, setPicking] = useState(false);
   const [held, setHeld] = useState<string[]>([]);
-  const [about, setAbout] = useState<{ name: string; version: string } | null>(null);
+  const [about, setAbout] = useState<{ name: string; version: string; cleared_leftover: boolean } | null>(null);
   const [updateNote, setUpdateNote] = useState<string | null>(null);
   const [iconsOnly, setIconsOnly] = useState(false);
   const [overflow, setOverflow] = useState<string[]>([]);
@@ -602,6 +643,8 @@ export function App() {
   const dialogRef = useRef<DialogState | null>(null);
   const namingRef = useRef<NamingState | null>(null);
   const mountedRef = useRef(true);
+  const accessRef = useRef<Access>("pending");
+  const quittingRef = useRef(false);
   const exportMenuRef = useRef<HTMLDetailsElement>(null);
   const splitGate = useRef<{ promise: Promise<void>; resolve: () => void } | null>(null);
   if (splitGate.current === null) {
@@ -625,6 +668,7 @@ export function App() {
   pickingRef.current = picking;
   dialogRef.current = dialog;
   namingRef.current = naming;
+  accessRef.current = access;
 
   const pages = visiblePages(session.pages);
   const names = useMemo(
@@ -646,6 +690,15 @@ export function App() {
 
   useEffect(() => {
     mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (access !== "editing") {
+      return;
+    }
     let live = true;
     postSplitCancel(token).finally(() => {
       if (live) {
@@ -654,45 +707,166 @@ export function App() {
     });
     return () => {
       live = false;
-      mountedRef.current = false;
+    };
+  }, [token, access]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let claiming = false;
+    let heartbeatTimer = 0;
+
+    function noteWarning(warning: boolean) {
+      if (!warning) {
+        setIdleWarning(false);
+        setWarningDismissed(false);
+        return;
+      }
+      setIdleWarning(true);
+    }
+
+    async function loadEditor() {
+      const [next, savedSettings, info] = await Promise.all([getSession(token), getSettings(token), getAbout(token)]);
+      if (cancelled) {
+        return;
+      }
+      setSession(next);
+      anchorRef.current = next.active_page_id;
+      setSettings(savedSettings);
+      setSettingsReady(true);
+      setAbout(info);
+      setLeftoverNotice(info.cleared_leftover);
+      accessRef.current = "editing";
+      setAccess("editing");
+      setError(null);
+    }
+
+    async function beat() {
+      if (quittingRef.current || accessRef.current !== "editing") {
+        return;
+      }
+      try {
+        const body = await postHeartbeat(token);
+        if (!cancelled) {
+          noteWarning(body.idle_warning);
+        }
+      } catch (reason: unknown) {
+        if (cancelled || accessRef.current !== "editing") {
+          return;
+        }
+        try {
+          await postClaim(token);
+          const next = await getSession(token);
+          if (cancelled) {
+            return;
+          }
+          setSession(next);
+          anchorRef.current = next.active_page_id;
+          setError(null);
+        } catch (claimError: unknown) {
+          if (cancelled) {
+            return;
+          }
+          window.clearInterval(heartbeatTimer);
+          if (claimError instanceof ApiError && claimError.status === 409) {
+            accessRef.current = "blocked";
+            setAccess("blocked");
+            return;
+          }
+          accessRef.current = "offline";
+          setAccess("offline");
+          setError(OFFLINE_MESSAGE);
+        }
+      }
+    }
+
+    async function tryClaim() {
+      if (cancelled || claiming || quittingRef.current || accessRef.current === "editing") {
+        return;
+      }
+      claiming = true;
+      try {
+        await postClaim(token);
+        if (cancelled) {
+          return;
+        }
+        await loadEditor();
+        if (cancelled) {
+          return;
+        }
+        window.clearInterval(heartbeatTimer);
+        void beat();
+        heartbeatTimer = window.setInterval(() => void beat(), 2000);
+      } catch (reason: unknown) {
+        if (cancelled) {
+          return;
+        }
+        if (reason instanceof ApiError && reason.status === 409) {
+          accessRef.current = "blocked";
+          setAccess("blocked");
+          return;
+        }
+        accessRef.current = "offline";
+        setAccess("offline");
+        setError(reason instanceof Error ? reason.message : OFFLINE_MESSAGE);
+      } finally {
+        claiming = false;
+      }
+    }
+
+    const onVisible = () => {
+      if (document.visibilityState === "visible") {
+        void beat();
+      }
+    };
+    // pagehide と F5 では release を送らない。sendBeacon も使わない。
+    document.addEventListener("visibilitychange", onVisible);
+    void tryClaim();
+    const claimTimer = window.setInterval(() => void tryClaim(), 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(claimTimer);
+      window.clearInterval(heartbeatTimer);
+      document.removeEventListener("visibilitychange", onVisible);
     };
   }, [token]);
 
   useEffect(() => {
-    let activeRequest = true;
-    getSession(token)
-      .then((next) => {
-        if (!activeRequest) {
-          return;
-        }
-        setSession(next);
-        anchorRef.current = next.active_page_id;
-      })
-      .catch((reason: unknown) => {
-        if (activeRequest) {
-          setError(reason instanceof Error ? reason.message : "編集状態を読めませんでした");
-        }
-      });
-    getSettings(token)
-      .then((next) => {
-        if (activeRequest) {
-          setSettings(next);
-        }
-      })
-      .catch((reason: unknown) => {
-        if (activeRequest) {
-          setError(reason instanceof Error ? reason.message : "設定を読めませんでした");
-        }
-      })
-      .finally(() => {
-        if (activeRequest) {
-          setSettingsReady(true);
-        }
-      });
-    return () => {
-      activeRequest = false;
+    if (access !== "editing") {
+      return;
+    }
+    let lastSent = 0;
+    const send = (source: "click" | "key" | "scroll") => {
+      const now = Date.now();
+      if (now - lastSent < 1000) {
+        return;
+      }
+      lastSent = now;
+      void postActivity(token, source).catch(() => undefined);
     };
-  }, [token]);
+    const onClick = (event: MouseEvent) => {
+      const target = event.target;
+      if (target instanceof Element && target.closest("[data-idle-dismiss]")) {
+        return;
+      }
+      send("click");
+    };
+    const onKey = (event: KeyboardEvent) => {
+      const target = event.target;
+      if (target instanceof Element && target.closest("[data-idle-dismiss]")) {
+        return;
+      }
+      send("key");
+    };
+    const onScroll = () => send("scroll");
+    window.addEventListener("click", onClick);
+    window.addEventListener("keydown", onKey);
+    window.addEventListener("scroll", onScroll, true);
+    return () => {
+      window.removeEventListener("click", onClick);
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("scroll", onScroll, true);
+    };
+  }, [token, access]);
 
   useEffect(() => {
     const onPop = () => setView(viewFromPath(window.location.pathname));
@@ -710,7 +884,7 @@ export function App() {
   }, [settings.theme]);
 
   useEffect(() => {
-    if (view !== "settings") {
+    if (view !== "settings" || access !== "editing") {
       return;
     }
     let live = true;
@@ -728,7 +902,7 @@ export function App() {
     return () => {
       live = false;
     };
-  }, [token, view]);
+  }, [token, view, access]);
 
   useEffect(() => {
     const node = workspaceRef.current;
@@ -740,7 +914,7 @@ export function App() {
     const observer = new ResizeObserver(update);
     observer.observe(node);
     return () => observer.disconnect();
-  }, []);
+  }, [access]);
 
   useEffect(() => {
     const wanted = documentKey ? documentKey.split("\n") : [];
@@ -863,6 +1037,11 @@ export function App() {
     try {
       const savedSettings = await putSettings(token, next);
       setSettings(savedSettings);
+      try {
+        await postActivity(token, "settings");
+      } catch {
+        // 設定は保存済み。計測のやり直しだけ失敗しても、表示は戻さない。
+      }
     } catch (reason: unknown) {
       setSettings(previous);
       setError(reason instanceof Error ? reason.message : "設定を保存できませんでした");
@@ -1304,6 +1483,11 @@ export function App() {
     try {
       const next = await postSettingsReset(token);
       setSettings(next);
+      try {
+        await postActivity(token, "settings");
+      } catch {
+        // 設定は初期化済み。計測のやり直しだけ失敗しても、表示は戻さない。
+      }
     } catch (reason: unknown) {
       setError(reason instanceof Error ? reason.message : "設定を初期状態に戻せませんでした");
     }
@@ -1646,6 +1830,42 @@ export function App() {
         ? null
         : selectPrompt;
 
+  async function continueWork() {
+    try {
+      await postActivity(token, "continue");
+      setIdleWarning(false);
+      setWarningDismissed(false);
+    } catch (reason: unknown) {
+      setError(reason instanceof Error ? reason.message : "計測をやり直せませんでした");
+    }
+  }
+
+  async function quit() {
+    const message = startFreshConfirmMessage(sessionRef.current);
+    if (message) {
+      const answer = await requestDialog({
+        kind: "confirm",
+        message,
+        confirmLabel: "破棄して新しく始める",
+        enterConfirms: false,
+        warn: true,
+      });
+      if (answer !== "confirm") {
+        return;
+      }
+    }
+    try {
+      quittingRef.current = true;
+      await postShutdown(token, true);
+      accessRef.current = "offline";
+      setAccess("offline");
+      setError(null);
+    } catch (reason: unknown) {
+      quittingRef.current = false;
+      setError(reason instanceof Error ? reason.message : "終了できませんでした");
+    }
+  }
+
   async function startFresh() {
     if (
       resettingRef.current ||
@@ -1776,12 +1996,65 @@ export function App() {
     const observer = new ResizeObserver(() => measure());
     observer.observe(bar);
     return () => observer.disconnect();
-  }, [view, loading, session.unsaved, session.split_unexported, settingsReady]);
+  }, [view, loading, session.unsaved, session.split_unexported, settingsReady, access]);
 
   const collapsed = new Set(overflow);
 
+  const browserBanner = browserNotice ? (
+    <div className="banner" role="status">
+      <p>{browserNotice}</p>
+      <button type="button" onClick={() => setBrowserNotice(null)}>
+        閉じる
+      </button>
+    </div>
+  ) : null;
+  const lossText = idleLossText(session);
+
+  if (access === "blocked") {
+    return (
+      <div className="app">
+        {browserBanner}
+        <p className="notice">{SECOND_TAB_MESSAGE}</p>
+      </div>
+    );
+  }
+
+  if (access !== "editing") {
+    return (
+      <div className="app">
+        {browserBanner}
+        {error ? <p className="notice">{error}</p> : null}
+      </div>
+    );
+  }
+
   return (
     <div className="app">
+      {browserBanner}
+      {leftoverNotice ? (
+        <div className="banner" role="status">
+          <p>{LEFTOVER_MESSAGE}</p>
+          <button type="button" onClick={() => setLeftoverNotice(false)}>
+            閉じる
+          </button>
+        </div>
+      ) : null}
+      {idleWarning && !warningDismissed ? (
+        <div className="banner" role="status">
+          <p>
+            操作が無いため、まもなく終了します。
+            {lossText}
+          </p>
+          <div className="banner-actions">
+            <button type="button" onClick={() => void continueWork()}>
+              作業を続ける
+            </button>
+            <button type="button" data-idle-dismiss onClick={() => setWarningDismissed(true)}>
+              閉じる
+            </button>
+          </div>
+        </div>
+      ) : null}
       <header className="chrome">
         <nav className="nav">
           <button type="button" className="tool nav-current" aria-current={view === "edit" ? "page" : undefined} onClick={() => openView("edit")}>
@@ -1810,6 +2083,9 @@ export function App() {
             読み込みを中止
           </button>
         ) : null}
+        <span data-collapse="exit" hidden={collapsed.has("exit")}>
+          <TipButton label="終了" icon="exit" warn onClick={() => void quit()} />
+        </span>
         <span data-collapse="start-fresh" hidden={collapsed.has("start-fresh")}>
           <TipButton
             label="新しく始める"
@@ -1957,6 +2233,11 @@ export function App() {
         <details className="overflow-menu" data-overflow-menu hidden={overflow.length === 0}>
           <summary aria-label="その他の操作">...</summary>
           <div className="menu-panel">
+            {collapsed.has("exit") ? (
+              <button type="button" className="warn-button" onClick={() => void quit()}>
+                終了
+              </button>
+            ) : null}
             {collapsed.has("start-fresh") ? (
               <button type="button" disabled={startFreshReason !== undefined} onClick={() => void startFresh()}>
                 新しく始める

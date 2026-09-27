@@ -1,6 +1,8 @@
 import asyncio
 import json
 import os
+import time
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -12,6 +14,7 @@ from app.auth import bearer_matches, new_token
 from app.export import ExportService
 from app.log_store import LogStore
 from app.open_pdfs import open_selected_pdfs
+from app.presence import RESETTING_SOURCES, SECOND_TAB_DETAIL, EditorLease, IdleWatch
 from app.save_dialog import ask_open_pdfs
 from app.session import Session
 from app.settings import SettingsStore
@@ -53,20 +56,37 @@ def render_index(token: str) -> str:
     return html.replace(TOKEN_PLACEHOLDER, token)
 
 
+LEASE_FREE = {
+    "/api/editor/claim",
+    "/api/editor/release",
+    "/api/editor/heartbeat",
+    "/api/editor/open",
+}
+
+
 def create_app(
     session: Session | None = None,
     settings_path: Path | None = None,
     log_dir: Path | None = None,
+    clock: Callable[[], float] | None = None,
+    stop: Callable[[], None] | None = None,
 ) -> FastAPI:
     session = session or Session()
     settings = SettingsStore(settings_path)
     logs = LogStore(log_dir)
     development = _development_enabled()
+    clock_fn = clock or time.monotonic
+    idle = IdleWatch(clock_fn, settings, session, stop or (lambda: None))
+    session.activity_listener = idle.on_activity
+    lease = EditorLease(clock_fn)
+    threaded_idle = clock is None
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         session.startup()
+        idle.start(threaded=threaded_idle)
         yield
+        idle.close()
 
     app = FastAPI(
         lifespan=lifespan,
@@ -82,6 +102,9 @@ def create_app(
     app.state.ask_open_pdfs = ask_open_pdfs
     app.state.version = read_app_version()
     app.state.token = new_token()
+    app.state.lease = lease
+    app.state.idle = idle
+    app.state.editor_tab_id = None
 
     @app.middleware("http")
     async def require_bearer(request: Request, call_next):
@@ -89,6 +112,8 @@ def create_app(
             header = request.headers.get("authorization", "")
             if not bearer_matches(header, app.state.token):
                 return JSONResponse(status_code=401, content={"detail": "認証が必要です"})
+            if request.url.path not in LEASE_FREE and not lease.holds(request.headers.get("x-tab-id")):
+                return JSONResponse(status_code=409, content={"detail": SECOND_TAB_DETAIL})
         return await call_next(request)
 
     @app.get("/", response_class=HTMLResponse)
@@ -99,7 +124,77 @@ def create_app(
 
     @app.get("/api/about")
     def get_about() -> dict:
-        return {"name": "PDF編集", "version": app.state.version}
+        return {
+            "name": "PDF編集",
+            "version": app.state.version,
+            "cleared_leftover": session.cleared_leftover,
+        }
+
+    async def read_tab_id(request: Request) -> tuple[str | None, JSONResponse | None]:
+        header = request.headers.get("x-tab-id")
+        body, error = await read_json_body(request, "タブの指定が不正です")
+        if error is not None:
+            return None, error
+        tab_id = body.get("tab_id") if isinstance(body, dict) else None
+        if not isinstance(tab_id, str) or tab_id == "" or not header or header != tab_id:
+            return None, JSONResponse(status_code=400, content={"detail": "タブの指定が不正です"})
+        return tab_id, None
+
+    @app.post("/api/editor/claim")
+    async def post_editor_claim(request: Request) -> JSONResponse:
+        tab_id, error = await read_tab_id(request)
+        if error is not None or tab_id is None:
+            return error
+        status, payload = lease.claim(tab_id)
+        return JSONResponse(status_code=status, content=payload)
+
+    @app.post("/api/editor/release")
+    async def post_editor_release(request: Request) -> JSONResponse:
+        tab_id, error = await read_tab_id(request)
+        if error is not None or tab_id is None:
+            return error
+        status, payload = lease.release(tab_id)
+        return JSONResponse(status_code=status, content=payload)
+
+    @app.post("/api/editor/heartbeat")
+    async def post_editor_heartbeat(request: Request) -> JSONResponse:
+        tab_id, error = await read_tab_id(request)
+        if error is not None or tab_id is None:
+            return error
+        holding = lease.heartbeat(tab_id)
+        return JSONResponse(status_code=200, content={"idle_warning": holding and idle.warning()})
+
+    @app.post("/api/activity")
+    async def post_activity(request: Request) -> JSONResponse:
+        body, error = await read_json_body(request, "操作の指定が不正です")
+        if error is not None:
+            return error
+        source = body.get("source") if isinstance(body, dict) else None
+        if source == "mousemove":
+            return JSONResponse(status_code=200, content={"reset": False})
+        if source not in RESETTING_SOURCES:
+            return JSONResponse(status_code=400, content={"detail": "操作の指定が不正です"})
+        idle.reset()
+        return JSONResponse(status_code=200, content={"reset": True})
+
+    @app.post("/api/shutdown")
+    async def post_shutdown(request: Request) -> JSONResponse:
+        raw = await request.body()
+        confirmed = False
+        if raw.strip():
+            try:
+                body = json.loads(raw)
+            except json.JSONDecodeError:
+                return JSONResponse(status_code=400, content={"detail": "終了の指定が不正です"})
+            if not isinstance(body, dict):
+                return JSONResponse(status_code=400, content={"detail": "終了の指定が不正です"})
+            confirmed = body.get("confirmed") is True
+        snapshot = session.snapshot()
+        dirty = bool(snapshot["unsaved"] or snapshot["split_unexported"])
+        if dirty and not confirmed:
+            return JSONResponse(status_code=200, content={"stopped": False})
+        idle.shutdown_now()
+        return JSONResponse(status_code=200, content={"stopped": True})
 
     @app.post("/api/logs/open")
     def post_logs_open() -> dict:
@@ -137,7 +232,10 @@ def create_app(
 
     @app.get("/api/session")
     def get_session() -> dict:
-        return session.snapshot()
+        body = session.snapshot()
+        if idle.warning():
+            body["idle_warning"] = True
+        return body
 
     @app.patch("/api/session/selection")
     async def patch_selection(request: Request) -> JSONResponse:

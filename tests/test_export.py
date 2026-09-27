@@ -11,7 +11,7 @@ from app.folders import FOLDER_NOTICE
 from app.main import create_app
 from app.save_dialog import documents_folder
 from app.session import Activity, Session
-from tests.test_session import load_pdf, patch_selection, post_command, visible_ids
+from tests.test_session import claim_tab, load_pdf, patch_selection, post_command, visible_ids
 
 STAGES = {"copying", "verifying", "committing", "completed", "failed"}
 
@@ -28,11 +28,12 @@ def env(tmp_path):
     session = Session(temp_dir=tmp_path / "pdf-editor")
     app = create_app(session, settings_path=tmp_path / "settings.json")
     with TestClient(app) as client:
+        claim_tab(client, app)
         yield client, app, session
 
 
 def auth(app) -> dict[str, str]:
-    return {"Authorization": f"Bearer {app.state.token}"}
+    return {"Authorization": f"Bearer {app.state.token}", "X-Tab-Id": app.state.editor_tab_id}
 
 
 def post_file(client, app, path: Path):

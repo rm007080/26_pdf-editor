@@ -44,10 +44,19 @@ def register_exit_cleanup(session: Session) -> None:
 def main() -> None:
     ensure_port_free()
     session = Session()
-    app = create_app(session)
+    holder: dict[str, uvicorn.Server] = {}
+
+    def stop() -> None:
+        server = holder.get("server")
+        if server is not None:
+            server.should_exit = True
+
+    app = create_app(session, stop=stop)
     register_exit_cleanup(session)
+    server = uvicorn.Server(uvicorn.Config(app, host=HOST, port=PORT))
+    holder["server"] = server
     threading.Thread(target=open_browser_when_ready, daemon=True).start()
-    uvicorn.run(app, host=HOST, port=PORT)
+    server.run()
 
 
 if __name__ == "__main__":

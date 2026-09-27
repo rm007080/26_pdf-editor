@@ -14,7 +14,16 @@ from app.save_dialog import documents_folder
 from app.session import Session
 from app.settings import default_settings_path
 from app.version import read_app_version
-from tests.test_session import auth, load_pdf, post_command, post_file, post_password, write_encrypted_pdf, write_pdf
+from tests.test_session import (
+    auth,
+    claim_tab,
+    load_pdf,
+    post_command,
+    post_file,
+    post_password,
+    write_encrypted_pdf,
+    write_pdf,
+)
 
 DEFAULT_SETTINGS = {
     "thumbnail_layout": "row",
@@ -52,6 +61,7 @@ def env(tmp_path):
     path = tmp_path / "settings" / "settings.json"
     app = create_app(session, settings_path=path)
     with TestClient(app) as client:
+        claim_tab(client, app)
         yield client, app, session, path
 
 
@@ -74,6 +84,7 @@ def test_broken_file_returns_defaults_and_app_starts(tmp_path):
     session = Session(temp_dir=tmp_path / "pdf-editor")
     app = create_app(session, settings_path=path)
     with TestClient(app) as client:
+        claim_tab(client, app)
         response = client.get("/api/settings", headers=auth(app))
     assert response.status_code == 200
     assert response.json() == DEFAULT_SETTINGS
@@ -530,7 +541,7 @@ def test_about_returns_name_and_version(env):
     before = client.get("/api/session", headers=auth(app)).json()
     response = client.get("/api/about", headers=auth(app))
     assert response.status_code == 200
-    assert response.json() == {"name": "PDF編集", "version": "0.1.0"}
+    assert response.json() == {"name": "PDF編集", "version": "0.1.0", "cleared_leftover": False}
     assert client.get("/api/about").status_code == 401
     assert client.get("/api/session", headers=auth(app)).json() == before
 

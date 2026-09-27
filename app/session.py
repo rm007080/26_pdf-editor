@@ -65,12 +65,16 @@ class Session:
         self.pause_during_reset = None
         self.before_commit = None
         self.fail_decrypt_save = None
+        self.activity_listener = None
+        self.cleared_leftover = False
         self._assign_selection([], None)
 
     def startup(self) -> None:
-        if self.temp_dir.exists():
+        self.cleared_leftover = False
+        if self.temp_dir.exists() and any(self.temp_dir.iterdir()):
             shutil.rmtree(self.temp_dir)
-        self.temp_dir.mkdir(parents=True)
+            self.cleared_leftover = True
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
         with self._lock:
             self._clear_workspace_unlocked()
             self._activity = Activity.IDLE
@@ -115,29 +119,47 @@ class Session:
         if self.temp_dir.exists():
             shutil.rmtree(self.temp_dir, ignore_errors=True)
 
+    def current_activity(self) -> Activity:
+        with self._lock:
+            return self._activity
+
     def try_begin(self, activity: Activity) -> bool:
         with self._lock:
             if self._activity is not Activity.IDLE:
                 return False
+            previous = self._activity
             self._activity = activity
-            return True
+        self._notify_activity(previous, activity)
+        return True
 
     def finish(self, activity: Activity) -> None:
         with self._lock:
-            if self._activity is activity:
-                self._activity = Activity.IDLE
+            if self._activity is not activity:
+                return
+            previous = self._activity
+            self._activity = Activity.IDLE
+        self._notify_activity(previous, Activity.IDLE)
 
     def transition(self, current: Activity, new: Activity) -> bool:
         with self._lock:
             if self._activity is not current:
                 return False
+            previous = self._activity
             self._activity = new
-            return True
+        self._notify_activity(previous, new)
+        return True
 
     def mark_dialog_before_commit_for_test(self) -> None:
         # 読み込み確定の直前にダイアログへ入った並びを、テストが再現する。
         with self._lock:
+            previous = self._activity
             self._activity = Activity.DIALOG
+        self._notify_activity(previous, Activity.DIALOG)
+
+    def _notify_activity(self, previous: Activity, new: Activity) -> None:
+        listener = self.activity_listener
+        if listener is not None and previous is not new:
+            listener(previous, new)
 
     def snapshot(self) -> dict[str, object]:
         with self._lock:

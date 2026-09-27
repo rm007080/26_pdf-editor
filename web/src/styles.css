@@ -427,6 +427,27 @@ details:not([open]) > .menu-panel {
   white-space: pre-line;
 }
 
+.banner {
+  display: flex;
+  gap: 0.75rem;
+  align-items: flex-start;
+  justify-content: space-between;
+  margin: 0;
+  padding: 0.65rem 1rem;
+  background: var(--notice);
+  color: var(--ink);
+}
+
+.banner p {
+  margin: 0;
+}
+
+.banner-actions {
+  display: flex;
+  gap: 0.5rem;
+  flex: none;
+}
+
 .thumbs {
   gap: 0.75rem;
   height: 100%;

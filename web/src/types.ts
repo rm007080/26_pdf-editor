@@ -24,6 +24,7 @@ export type SessionState = {
   unsaved: boolean;
   split_positions: number[];
   split_unexported: boolean;
+  idle_warning?: boolean;
 };
 
 export type CommandResult = SessionState & {
