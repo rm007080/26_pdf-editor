@@ -14,6 +14,7 @@ import {
   postCommand,
   postDocument,
   postDuplicate,
+  postExitCancel,
   postExport,
   postHeartbeat,
   postLogsOpen,
@@ -206,7 +207,7 @@ const BYTE_LIMIT = 100 * 1024 * 1024;
 
 type DialogState =
   | { kind: "password"; filename: string; documentId: string; error: string | null }
-  | { kind: "confirm"; message: string; confirmLabel: string; enterConfirms?: boolean; warn?: boolean };
+  | { kind: "confirm"; message: string; confirmLabel: string; enterConfirms?: boolean; warn?: boolean; purpose?: "exit" };
 
 type DialogAnswer = DocumentIntake | "confirm" | "cancel" | "abort" | { failed: string };
 
@@ -645,6 +646,12 @@ export function App() {
   const mountedRef = useRef(true);
   const accessRef = useRef<Access>("pending");
   const quittingRef = useRef(false);
+  const exitOfferRef = useRef(false);
+  const exitPendingRef = useRef(false);
+  const onHeartbeat = useRef<
+    (body: { idle_warning: boolean; exit_requested?: boolean; holding?: boolean }) => void
+  >(() => undefined);
+  const onHeartbeatLost = useRef<() => void>(() => undefined);
   const exportMenuRef = useRef<HTMLDetailsElement>(null);
   const splitGate = useRef<{ promise: Promise<void>; resolve: () => void } | null>(null);
   if (splitGate.current === null) {
@@ -715,15 +722,6 @@ export function App() {
     let claiming = false;
     let heartbeatTimer = 0;
 
-    function noteWarning(warning: boolean) {
-      if (!warning) {
-        setIdleWarning(false);
-        setWarningDismissed(false);
-        return;
-      }
-      setIdleWarning(true);
-    }
-
     async function loadEditor() {
       const [next, savedSettings, info] = await Promise.all([getSession(token), getSettings(token), getAbout(token)]);
       if (cancelled) {
@@ -747,9 +745,10 @@ export function App() {
       try {
         const body = await postHeartbeat(token);
         if (!cancelled) {
-          noteWarning(body.idle_warning);
+          onHeartbeat.current(body);
         }
       } catch (reason: unknown) {
+        onHeartbeatLost.current();
         if (cancelled || accessRef.current !== "editing") {
           return;
         }
@@ -1189,6 +1188,86 @@ export function App() {
       setDialog(next);
     });
   }
+
+  function dismissExitConfirm() {
+    if (!exitPendingRef.current) {
+      return;
+    }
+    exitPendingRef.current = false;
+    exitOfferRef.current = false;
+    finishDialog("abort");
+  }
+
+  async function offerExit() {
+    if (exitOfferRef.current || exitPendingRef.current || dialogRef.current) {
+      return;
+    }
+    const message = startFreshConfirmMessage(sessionRef.current);
+    if (!message) {
+      return;
+    }
+    exitOfferRef.current = true;
+    const answer = await new Promise<DialogAnswer>((resolve) => {
+      exitPendingRef.current = true;
+      pendingDialog.current = (value) => {
+        exitPendingRef.current = false;
+        resolve(value);
+      };
+      setDialog({
+        kind: "confirm",
+        message,
+        confirmLabel: "破棄して新しく始める",
+        enterConfirms: false,
+        warn: true,
+        purpose: "exit",
+      });
+    });
+    exitOfferRef.current = false;
+    if (answer === "abort") {
+      return;
+    }
+    if (answer !== "confirm") {
+      try {
+        await postExitCancel(token);
+      } catch {
+        // 編集権が無いときはサーバがメッセージボックスへ進む。この閉じる処理は exit-cancel に頼らない。
+      }
+      return;
+    }
+    try {
+      quittingRef.current = true;
+      await postShutdown(token, true);
+      accessRef.current = "offline";
+      setAccess("offline");
+      setError(null);
+    } catch (reason: unknown) {
+      quittingRef.current = false;
+      setError(reason instanceof Error ? reason.message : "終了できませんでした");
+    }
+  }
+
+  onHeartbeat.current = (body) => {
+    if (body.holding === false) {
+      dismissExitConfirm();
+      accessRef.current = "blocked";
+      setAccess("blocked");
+      return;
+    }
+    if (!body.idle_warning) {
+      setIdleWarning(false);
+      setWarningDismissed(false);
+    } else {
+      setIdleWarning(true);
+    }
+    if (body.exit_requested) {
+      void offerExit();
+    } else {
+      dismissExitConfirm();
+    }
+  };
+  onHeartbeatLost.current = () => {
+    dismissExitConfirm();
+  };
 
   function abortLoading() {
     abortRef.current = true;

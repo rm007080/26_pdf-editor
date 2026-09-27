@@ -25,6 +25,7 @@ export type SessionState = {
   split_positions: number[];
   split_unexported: boolean;
   idle_warning?: boolean;
+  exit_requested?: boolean;
 };
 
 export type CommandResult = SessionState & {

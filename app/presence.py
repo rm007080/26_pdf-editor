@@ -6,6 +6,7 @@ from app.settings import SettingsStore
 
 SECOND_TAB_DETAIL = "編集画面は別のタブで開いています。このタブでは編集できません。開いているタブに戻ってください。"
 LEASE_LIMIT_SECONDS = 5.0
+EXIT_WAIT_SECONDS = 5.0
 WARNING_REMAINING_SECONDS = 60.0
 RESETTING_SOURCES = {"click", "key", "scroll", "settings", "continue"}
 
@@ -60,6 +61,87 @@ class EditorLease:
             self._expire(now)
             return self._holder == tab_id
 
+    def holder(self) -> str | None:
+        now = self._clock()
+        with self._lock:
+            self._expire(now)
+            return self._holder
+
+    def last_seen(self) -> float | None:
+        now = self._clock()
+        with self._lock:
+            self._expire(now)
+            return self._seen
+
+
+class ExitRequest:
+    def __init__(
+        self,
+        clock: Callable[[], float],
+        on_fallback: Callable[[str], None],
+        message_for: Callable[[], str | None],
+        on_clean: Callable[[], None] | None = None,
+    ) -> None:
+        self._clock = clock
+        self._on_fallback = on_fallback
+        self._message_for = message_for
+        self._on_clean = on_clean
+        self._lock = threading.Lock()
+        self._requested = False
+        self._seen: float | None = None
+
+    @property
+    def requested(self) -> bool:
+        with self._lock:
+            return self._requested
+
+    def begin(self, seen: float | None) -> None:
+        now = self._clock()
+        with self._lock:
+            self._requested = True
+            self._seen = now if seen is None else seen
+
+    def cancel(self) -> None:
+        with self._lock:
+            self._requested = False
+            self._seen = None
+
+    def note_heartbeat(self, holding: bool) -> None:
+        if not holding or not self.requested:
+            return
+        if self._message_for() is None:
+            self._fallback_if_requested()
+            return
+        now = self._clock()
+        with self._lock:
+            if self._requested:
+                self._seen = now
+
+    def on_holder_released(self) -> None:
+        self._fallback_if_requested()
+
+    def poll(self) -> None:
+        now = self._clock()
+        with self._lock:
+            if not self._requested or self._seen is None:
+                return
+            due = now - self._seen > EXIT_WAIT_SECONDS
+        if due:
+            self._fallback_if_requested()
+
+    def _fallback_if_requested(self) -> None:
+        with self._lock:
+            if not self._requested:
+                return
+            self._requested = False
+            self._seen = None
+        message = self._message_for()
+        if message is None:
+            if self._on_clean is not None:
+                self._on_clean()
+            return
+        self._on_fallback(message)
+
 
 class IdleWatch:
     def __init__(
@@ -68,11 +150,13 @@ class IdleWatch:
         settings: SettingsStore,
         session: Session,
         stop: Callable[[], None],
+        on_tick: Callable[[], None] | None = None,
     ) -> None:
         self._clock = clock
         self._settings = settings
         self._session = session
         self._stop = stop
+        self._on_tick = on_tick
         self._lock = threading.Lock()
         self._origin: float | None = None
         self._budget: float | None = None
@@ -135,6 +219,8 @@ class IdleWatch:
         return self.remaining() <= WARNING_REMAINING_SECONDS
 
     def tick(self) -> None:
+        if self._on_tick is not None:
+            self._on_tick()
         if self._session.current_activity() is Activity.EXPORTING:
             return
         if self.remaining() <= 0:

@@ -2127,12 +2127,19 @@ def test_editor_routes_reject_a_tab_that_does_not_hold_the_lease(env, method, pa
     assert "pages" not in missing.json()
 
 
-def test_editor_open_is_not_an_editor_lease_conflict(env):
-    client, app, _session = env
+def test_editor_open_is_not_an_editor_lease_conflict(env, monkeypatch):
+    opened_urls = []
+    monkeypatch.setattr("app.main.webbrowser.open", lambda url: opened_urls.append(url))
+    client, app, session = env
+    before = session.snapshot()
     opened = client.post("/api/editor/open", headers={"Authorization": f"Bearer {app.state.token}"})
     anonymous = client.post("/api/editor/open")
-    assert opened.status_code == 404
+    assert opened.status_code == 200
+    assert opened.json() == {"opened": True}
+    assert app.state.token not in opened.text
     assert anonymous.status_code == 401
+    assert opened_urls == ["http://127.0.0.1:8765/"]
+    assert session.snapshot() == before
 
 
 def test_leftover_temp_files_are_cleared_once(tmp_path):

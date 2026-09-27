@@ -115,12 +115,20 @@ export function postClaim(token: string): Promise<Record<string, never>> {
   }).then((response) => readJson<Record<string, never>>(response));
 }
 
-export function postHeartbeat(token: string): Promise<{ idle_warning: boolean }> {
+export function postHeartbeat(
+  token: string,
+): Promise<{ idle_warning: boolean; exit_requested: boolean; holding: boolean }> {
   return request(token, "/api/editor/heartbeat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ tab_id: tabId() }),
-  }).then((response) => readJson<{ idle_warning: boolean }>(response));
+  }).then((response) => readJson<{ idle_warning: boolean; exit_requested: boolean; holding: boolean }>(response));
+}
+
+export function postExitCancel(token: string): Promise<{ exit_requested: boolean }> {
+  return request(token, "/api/session/exit-cancel", { method: "POST" }).then((response) =>
+    readJson<{ exit_requested: boolean }>(response),
+  );
 }
 
 export function postActivity(

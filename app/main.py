@@ -1,7 +1,9 @@
 import asyncio
 import json
 import os
+import sys
 import time
+import webbrowser
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -14,14 +16,14 @@ from app.auth import bearer_matches, new_token
 from app.export import ExportService
 from app.log_store import LogStore
 from app.open_pdfs import open_selected_pdfs
-from app.presence import RESETTING_SOURCES, SECOND_TAB_DETAIL, EditorLease, IdleWatch
+from app.presence import RESETTING_SOURCES, SECOND_TAB_DETAIL, EditorLease, ExitRequest, IdleWatch
 from app.save_dialog import ask_open_pdfs
 from app.session import Session
 from app.settings import SettingsStore
+from app.tray import loss_confirm_message
 from app.version import read_app_version
 
-DIST_DIR = Path(__file__).resolve().parent.parent / "web" / "dist"
-DIST_INDEX = DIST_DIR / "index.html"
+EDITOR_URL = "http://127.0.0.1:8765/"
 TOKEN_PLACEHOLDER = "__PDF_EDITOR_TOKEN__"
 FALLBACK_INDEX = """<!DOCTYPE html>
 <html lang="ja">
@@ -37,6 +39,16 @@ FALLBACK_INDEX = """<!DOCTYPE html>
 """
 
 
+def dist_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys._MEIPASS) / "web" / "dist"
+    return Path(__file__).resolve().parent.parent / "web" / "dist"
+
+
+def open_editor_page() -> None:
+    webbrowser.open(EDITOR_URL)
+
+
 def _development_enabled() -> bool:
     return os.environ.get("PDF_EDITOR_ENV", "development") == "development"
 
@@ -49,8 +61,9 @@ async def read_json_body(request: Request, invalid_detail: str) -> tuple[object,
 
 
 def render_index(token: str) -> str:
-    if DIST_INDEX.is_file():
-        html = DIST_INDEX.read_text(encoding="utf-8")
+    index = dist_dir() / "index.html"
+    if index.is_file():
+        html = index.read_text(encoding="utf-8")
     else:
         html = FALLBACK_INDEX
     return html.replace(TOKEN_PLACEHOLDER, token)
@@ -70,13 +83,32 @@ def create_app(
     log_dir: Path | None = None,
     clock: Callable[[], float] | None = None,
     stop: Callable[[], None] | None = None,
+    present_exit: Callable[[str], None] | None = None,
 ) -> FastAPI:
     session = session or Session()
     settings = SettingsStore(settings_path)
     logs = LogStore(log_dir)
     development = _development_enabled()
     clock_fn = clock or time.monotonic
-    idle = IdleWatch(clock_fn, settings, session, stop or (lambda: None))
+
+    def exit_message() -> str | None:
+        snapshot = session.snapshot()
+        return loss_confirm_message(bool(snapshot["unsaved"]), bool(snapshot["split_unexported"]))
+
+    clean_stop: list[Callable[[], None]] = []
+
+    def on_clean() -> None:
+        if clean_stop:
+            clean_stop[0]()
+
+    exit_request = ExitRequest(
+        clock_fn,
+        present_exit or (lambda _text: None),
+        exit_message,
+        on_clean,
+    )
+    idle = IdleWatch(clock_fn, settings, session, stop or (lambda: None), on_tick=exit_request.poll)
+    clean_stop.append(idle.shutdown_now)
     session.activity_listener = idle.on_activity
     lease = EditorLease(clock_fn)
     threaded_idle = clock is None
@@ -104,6 +136,7 @@ def create_app(
     app.state.token = new_token()
     app.state.lease = lease
     app.state.idle = idle
+    app.state.exit_request = exit_request
     app.state.editor_tab_id = None
 
     @app.middleware("http")
@@ -153,7 +186,10 @@ def create_app(
         tab_id, error = await read_tab_id(request)
         if error is not None or tab_id is None:
             return error
+        was_holder = lease.holds(tab_id)
         status, payload = lease.release(tab_id)
+        if was_holder:
+            exit_request.on_holder_released()
         return JSONResponse(status_code=status, content=payload)
 
     @app.post("/api/editor/heartbeat")
@@ -162,7 +198,20 @@ def create_app(
         if error is not None or tab_id is None:
             return error
         holding = lease.heartbeat(tab_id)
-        return JSONResponse(status_code=200, content={"idle_warning": holding and idle.warning()})
+        exit_request.note_heartbeat(holding)
+        return JSONResponse(
+            status_code=200,
+            content={
+                "idle_warning": holding and idle.warning(),
+                "exit_requested": bool(holding and exit_request.requested),
+                "holding": holding,
+            },
+        )
+
+    @app.post("/api/editor/open")
+    def post_editor_open() -> dict:
+        open_editor_page()
+        return {"opened": True}
 
     @app.post("/api/activity")
     async def post_activity(request: Request) -> JSONResponse:
@@ -235,6 +284,8 @@ def create_app(
         body = session.snapshot()
         if idle.warning():
             body["idle_warning"] = True
+        if exit_request.requested:
+            body["exit_requested"] = True
         return body
 
     @app.patch("/api/session/selection")
@@ -244,6 +295,11 @@ def create_app(
             return error
         status, payload = session.update_selection(body)
         return JSONResponse(status_code=status, content=payload)
+
+    @app.post("/api/session/exit-cancel")
+    def post_exit_cancel() -> dict:
+        exit_request.cancel()
+        return {"exit_requested": False}
 
     @app.post("/api/session/reset")
     async def post_session_reset() -> JSONResponse:
@@ -347,7 +403,7 @@ def create_app(
         status, body = exporter.open_saved_folder(job_id)
         return JSONResponse(status_code=status, content=body)
 
-    assets = DIST_DIR / "assets"
+    assets = dist_dir() / "assets"
     if assets.is_dir():
         app.mount("/assets", StaticFiles(directory=assets), name="assets")
 
