@@ -7,9 +7,12 @@ from uuid import uuid4
 
 import pikepdf
 
+from app.folders import initial_directory, with_notice
+from app.notify import show_notification
 from app.open_path import open_file, open_folder
-from app.save_dialog import ask_folder, ask_save_path, documents_folder
+from app.save_dialog import ask_folder, ask_save_path
 from app.session import Activity, Session
+from app.settings import SettingsStore
 
 
 class ExportFailure(Exception):
@@ -46,8 +49,10 @@ class Job:
 
 
 class ExportService:
-    def __init__(self, session: Session) -> None:
+    def __init__(self, session: Session, settings: SettingsStore) -> None:
         self.session = session
+        self.settings = settings
+        self.show_notification = show_notification
         self.ask_save_path = ask_save_path
         self.ask_folder = ask_folder
         self.enough_space = enough_space
@@ -73,7 +78,7 @@ class ExportService:
         if plan is None:
             self.session.finish(Activity.DIALOG)
             return 400, {"detail": "書き出すページがありません"}
-        initial_dir = documents_folder()
+        initial_dir, notice = initial_directory(self.settings.read()["last_save_dir"])
         initial_name = initial_filename(str(plan["filename"]))
         pages = list(plan["pages"])
         required_bytes = int(plan["bytes"])
@@ -85,13 +90,16 @@ class ExportService:
             return 500, {"detail": "保存ダイアログを開けませんでした"}
         if chosen is None:
             self.session.finish(Activity.DIALOG)
-            return 200, {"status": "cancelled"}
-        job_id = self._create_job(Path(chosen), pages, sources, required_bytes, kind=kind)
+            return 200, with_notice({"status": "cancelled"}, notice)
+        chosen_path = Path(chosen)
+        job_id = self._create_job(chosen_path, pages, sources, required_bytes, kind=kind)
         if not self.session.transition(Activity.DIALOG, Activity.EXPORTING):
+            self._discard_job(job_id)
             self.session.finish(Activity.DIALOG)
             return 409, {"detail": "書き出しを開始できませんでした"}
+        self.settings.remember_directory("last_save_dir", chosen_path.parent)
         asyncio.get_running_loop().run_in_executor(None, self.run_job, job_id)
-        return 200, {"job_id": job_id}
+        return 200, with_notice({"job_id": job_id}, notice)
 
     async def begin_split(self) -> tuple[int, dict]:
         if not self.session.try_begin(Activity.DIALOG):
@@ -103,8 +111,9 @@ class ExportService:
         ticket = object()
         with self._lock:
             self._split = {"kind": "folder", "ticket": ticket}
+        initial_dir, notice = initial_directory(self.settings.read()["last_save_dir"])
         try:
-            chosen = await asyncio.to_thread(self.ask_folder, documents_folder())
+            chosen = await asyncio.to_thread(self.ask_folder, initial_dir)
         except Exception:
             if self._drop_split(ticket):
                 self.session.finish(Activity.DIALOG)
@@ -112,12 +121,12 @@ class ExportService:
         if chosen is None:
             if self._drop_split(ticket):
                 self.session.finish(Activity.DIALOG)
-            return 200, {"status": "cancelled"}
+            return 200, with_notice({"status": "cancelled"}, notice)
         groups = list(proposal["groups"])
         names = [f"{proposal['stem']}_{index}.pdf" for index in range(1, len(groups) + 1)]
         with self._lock:
             if self._split is None or self._split.get("ticket") is not ticket:
-                return 200, {"status": "cancelled"}
+                return 200, with_notice({"status": "cancelled"}, notice)
             self._split = {
                 "kind": "naming",
                 "ticket": ticket,
@@ -127,10 +136,13 @@ class ExportService:
                 "paths": dict(proposal["paths"]),
                 "bytes": int(proposal["bytes"]),
             }
-        return 200, {
-            "status": "naming",
-            "files": [{"name": name, "pages": len(group["page_ids"])} for name, group in zip(names, groups)],
-        }
+        return 200, with_notice(
+            {
+                "status": "naming",
+                "files": [{"name": name, "pages": len(group["page_ids"])} for name, group in zip(names, groups)],
+            },
+            notice,
+        )
 
     async def confirm_split(self, body: object) -> tuple[int, dict]:
         with self._lock:
@@ -170,6 +182,7 @@ class ExportService:
             return 409, {"detail": "書き出しを開始できませんでした"}
         with self._lock:
             self._split = None
+        self.settings.remember_directory("last_save_dir", directory)
         asyncio.get_running_loop().run_in_executor(None, self.run_job, job_id)
         return 200, {"job_id": job_id}
 
@@ -268,6 +281,7 @@ class ExportService:
             self._run_split(job_id)
             return
         temp_path: Path | None = None
+        outcome: bool | None = None
         try:
             requested, total, pages, sources, required_bytes = self._job_plan(job_id)
             self._update(job_id, stage="copying")
@@ -286,17 +300,22 @@ class ExportService:
             if self._job_kind(job_id) == "all":
                 self.session.mark_saved(pages)
             self._update(job_id, stage="completed", path=final, processed_pages=total)
+            outcome = True
         except Exception as exc:
             if temp_path is not None:
                 temp_path.unlink(missing_ok=True)
             message = str(exc) if str(exc) else "書き出しに失敗しました"
             self._update(job_id, stage="failed", detail=message)
+            outcome = False
         finally:
             self.session.finish(Activity.EXPORTING)
+        if outcome is not None:
+            self._notify(outcome)
 
     def _run_split(self, job_id: str) -> None:
         temps: list[Path] = []
         committed: list[Path] = []
+        outcome: bool | None = None
         try:
             parts, sources, required_bytes, group_ids = self._split_plan(job_id)
             total = sum(len(pages) for _requested, pages in parts)
@@ -330,6 +349,7 @@ class ExportService:
                 committed.append(chosen)
             self.session.mark_split_exported(group_ids)
             self._update(job_id, stage="completed", files=list(committed), processed_pages=total, path=None)
+            outcome = True
         except Exception as exc:
             for path in temps:
                 path.unlink(missing_ok=True)
@@ -337,8 +357,20 @@ class ExportService:
                 path.unlink(missing_ok=True)
             message = str(exc) if str(exc) else "書き出しに失敗しました"
             self._update(job_id, stage="failed", detail=message)
+            outcome = False
         finally:
             self.session.finish(Activity.EXPORTING)
+        if outcome is not None:
+            self._notify(outcome)
+
+    def _notify(self, success: bool) -> None:
+        try:
+            if self.settings.read()["windows_notifications"] is not True:
+                return
+            body = "書き出しが完了しました" if success else "書き出しに失敗しました"
+            self.show_notification("PDF編集", body)
+        except Exception:
+            return
 
     def _create_job(
         self,

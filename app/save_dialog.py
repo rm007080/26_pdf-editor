@@ -8,7 +8,9 @@ from pathlib import Path
 _COINIT_APARTMENTTHREADED = 0x2
 _OFN_HIDEREADONLY = 0x00000004
 _OFN_NOCHANGEDIR = 0x00000008
+_OFN_ALLOWMULTISELECT = 0x00000200
 _OFN_PATHMUSTEXIST = 0x00000800
+_OFN_FILEMUSTEXIST = 0x00001000
 _OFN_EXPLORER = 0x00080000
 
 _sta_queue: queue.Queue = queue.Queue()
@@ -92,6 +94,10 @@ def ask_folder(initial_dir: Path) -> Path | None:
     return _call_on_sta(_show_folder_dialog, initial_dir)
 
 
+def ask_open_pdfs(initial_dir: Path) -> list[Path] | None:
+    return _call_on_sta(_show_open_dialog, initial_dir)
+
+
 def _ensure_sta() -> None:
     global _sta_started
     with _sta_lock:
@@ -160,6 +166,59 @@ def _show_save_dialog(initial_dir: Path, initial_filename: str) -> Path | None:
     if comdlg32.CommDlgExtendedError() == 0:
         return None
     raise OSError("保存ダイアログを開けませんでした")
+
+
+def _show_open_dialog(initial_dir: Path) -> list[Path] | None:
+    comdlg32 = ctypes.WinDLL("comdlg32", use_last_error=True)
+    comdlg32.GetOpenFileNameW.argtypes = [ctypes.POINTER(OPENFILENAMEW)]
+    comdlg32.GetOpenFileNameW.restype = wintypes.BOOL
+    comdlg32.CommDlgExtendedError.argtypes = []
+    comdlg32.CommDlgExtendedError.restype = wintypes.DWORD
+
+    file_buffer = ctypes.create_unicode_buffer(65536)
+    file_filter = ctypes.create_unicode_buffer("PDF\0*.pdf\0\0")
+    flags = (
+        _OFN_EXPLORER
+        | _OFN_PATHMUSTEXIST
+        | _OFN_FILEMUSTEXIST
+        | _OFN_ALLOWMULTISELECT
+        | _OFN_NOCHANGEDIR
+        | _OFN_HIDEREADONLY
+    )
+    ofn = OPENFILENAMEW()
+    ofn.lStructSize = ctypes.sizeof(OPENFILENAMEW)
+    ofn.lpstrFilter = ctypes.cast(file_filter, wintypes.LPCWSTR)
+    ofn.nFilterIndex = 1
+    ofn.lpstrFile = ctypes.cast(file_buffer, wintypes.LPWSTR)
+    ofn.nMaxFile = len(file_buffer)
+    ofn.lpstrInitialDir = str(initial_dir)
+    ofn.lpstrTitle = "PDF を選ぶ"
+    ofn.Flags = flags
+    ofn.lpstrDefExt = "pdf"
+    if not comdlg32.GetOpenFileNameW(ctypes.byref(ofn)):
+        if comdlg32.CommDlgExtendedError() == 0:
+            return None
+        raise OSError("ファイル選択を完了できませんでした")
+    return _paths_from_open_buffer(file_buffer)
+
+
+def _paths_from_open_buffer(buffer: ctypes.Array) -> list[Path]:
+    parts: list[str] = []
+    chunk: list[str] = []
+    for char in buffer:
+        if char == "\0":
+            if not chunk:
+                break
+            parts.append("".join(chunk))
+            chunk = []
+            continue
+        chunk.append(char)
+    if not parts:
+        return []
+    if len(parts) == 1:
+        return [Path(parts[0])]
+    directory = Path(parts[0])
+    return [directory / name for name in parts[1:]]
 
 
 # BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_EDITBOX

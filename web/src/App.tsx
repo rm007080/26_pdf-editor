@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type FormEvent, type PointerEvent as ReactPointerEvent } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent, type FormEvent, type PointerEvent as ReactPointerEvent } from "react";
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import {
   ApiError,
   discardDocuments,
+  getAbout,
   getExportJob,
   getSession,
   getSettings,
@@ -10,10 +11,14 @@ import {
   patchSelection,
   postCommand,
   postDocument,
+  postDuplicate,
   postExport,
+  postLogsOpen,
+  postOpenPdfs,
   postPassword,
   postSelectionExport,
   postSessionReset,
+  postSettingsReset,
   postSplit,
   postSplitCancel,
   postSplitConfirm,
@@ -38,7 +43,11 @@ import type {
   DocumentIntake,
   EditCommand,
   ExportJob,
+  IdleMinutes,
+  OpenedDocument,
+  RejectedDocument,
   SessionState,
+  ThemeChoice,
   ThumbnailLayout,
   ThumbnailSize,
   ViewSettings,
@@ -72,7 +81,47 @@ const defaultSettings: ViewSettings = {
   thumbnail_layout: "row",
   thumbnail_size: "medium",
   pane_ratio: null,
+  theme: null,
+  windows_notifications: true,
+  idle_minutes: 120,
+  last_open_dir: null,
+  last_save_dir: null,
 };
+
+type AppView = "edit" | "settings" | "help";
+
+const TOOLBAR_COLLAPSE_ORDER = [
+  "exit",
+  "start-fresh",
+  "layout",
+  "clear-splits",
+  "redo",
+  "undo",
+  "rotate-left",
+  "rotate-right",
+  "delete",
+] as const;
+
+const IDLE_CHOICES: { value: IdleMinutes; label: string }[] = [
+  { value: 30, label: "30分" },
+  { value: 60, label: "1時間" },
+  { value: 120, label: "2時間" },
+  { value: 240, label: "4時間" },
+];
+
+function viewFromPath(pathname: string): AppView {
+  if (pathname === "/settings") {
+    return "settings";
+  }
+  if (pathname === "/help") {
+    return "help";
+  }
+  return "edit";
+}
+
+function isOpened(item: OpenedDocument | RejectedDocument): item is OpenedDocument {
+  return "document_id" in item;
+}
 
 function startFreshConfirmMessage(current: { unsaved: boolean; split_unexported: boolean }): string | null {
   if (current.unsaved && current.split_unexported) {
@@ -354,8 +403,27 @@ function SplitNamingDialog({
   );
 }
 
+function Icon({ name }: { name: string }) {
+  const common = { fill: "none", stroke: "currentColor", strokeWidth: 2, strokeLinecap: "round" as const, strokeLinejoin: "round" as const };
+  return (
+    <svg className="tool-icon" viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+      {name === "start" ? <path {...common} d="M4 6h16M4 12h10M4 18h16" /> : null}
+      {name === "undo" ? <path {...common} d="M8 8H4v4M4 8c3 6 8 8 16 6" /> : null}
+      {name === "redo" ? <path {...common} d="M16 8h4v4M20 8c-3 6-8 8-16 6" /> : null}
+      {name === "left" ? <path {...common} d="M8 8l-4 4 4 4M4 12h10a6 6 0 0 1 0 0" /> : null}
+      {name === "right" ? <path {...common} d="M16 8l4 4-4 4M20 12H10" /> : null}
+      {name === "trash" ? <path {...common} d="M5 7h14M9 7V5h6v2M8 7l1 12h6l1-12" /> : null}
+      {name === "clear" ? <path {...common} d="M6 6l12 12M8 4h8M6 20h12" /> : null}
+      {name === "row" ? <path {...common} d="M4 8h4v8H4zM10 8h4v8h-4zM16 8h4v8h-4z" /> : null}
+      {name === "grid" ? <path {...common} d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z" /> : null}
+      {name === "export" ? <path {...common} d="M12 4v10M8 10l4 4 4-4M5 20h14" /> : null}
+    </svg>
+  );
+}
+
 function TipButton({
   label,
+  icon,
   disabled,
   reason,
   title,
@@ -364,6 +432,7 @@ function TipButton({
   onClick,
 }: {
   label: string;
+  icon?: string;
   disabled?: boolean;
   reason?: string;
   title?: string;
@@ -375,14 +444,111 @@ function TipButton({
     <span className="tip" title={title ?? (disabled ? reason : undefined)}>
       <button
         type="button"
-        className={warn ? "warn-button" : undefined}
+        className={warn ? "tool warn-button" : "tool"}
         disabled={disabled}
         aria-pressed={pressed}
         onClick={onClick}
       >
-        {label}
+        {icon ? <Icon name={icon} /> : null}
+        <span className="tool-label">{label}</span>
       </button>
     </span>
+  );
+}
+
+function SettingsScreen({
+  settings,
+  ready,
+  about,
+  updateNote,
+  onTheme,
+  onNotifications,
+  onIdle,
+  onReset,
+  onOpenLogs,
+  onCheckUpdates,
+}: {
+  settings: ViewSettings;
+  ready: boolean;
+  about: { name: string; version: string } | null;
+  updateNote: string | null;
+  onTheme: (theme: ThemeChoice) => void;
+  onNotifications: (enabled: boolean) => void;
+  onIdle: (minutes: IdleMinutes) => void;
+  onReset: () => void;
+  onOpenLogs: () => void;
+  onCheckUpdates: () => void;
+}) {
+  return (
+    <section className="page">
+      <h2>設定</h2>
+      <p className="hint">選んでいないあいだは、この端末の色に合わせます。選んだあとは、その選択を記憶します。</p>
+      <div className="choice-row">
+        <TipButton label="ライト" pressed={settings.theme === "light"} disabled={!ready} onClick={() => onTheme("light")} />
+        <TipButton label="ダーク" pressed={settings.theme === "dark"} disabled={!ready} onClick={() => onTheme("dark")} />
+      </div>
+      <label className="choice-row">
+        <input
+          type="checkbox"
+          checked={settings.windows_notifications}
+          disabled={!ready}
+          onChange={(event) => onNotifications(event.target.checked)}
+        />
+        Windows 通知
+      </label>
+      <label className="choice-row">
+        自動終了までの時間
+        <select
+          aria-label="自動終了までの時間"
+          value={settings.idle_minutes}
+          disabled={!ready}
+          onChange={(event) => onIdle(Number(event.target.value) as IdleMinutes)}
+        >
+          {IDLE_CHOICES.map((choice) => (
+            <option key={choice.value} value={choice.value}>
+              {choice.label}
+            </option>
+          ))}
+        </select>
+      </label>
+      <p className="hint">この画面では終了のタイマーは動きません。選んだ時間だけを保存します。</p>
+      <button type="button" className="tool warn-button" disabled={!ready} onClick={onReset}>
+        <span className="tool-label">設定を初期状態に戻す</span>
+      </button>
+      <div className="about-block">
+        <p>{about ? `${about.name} ${about.version}` : "PDF編集"}</p>
+        <button type="button" className="tool" onClick={onCheckUpdates}>
+          <span className="tool-label">更新を確認</span>
+        </button>
+        {updateNote ? <p className="hint">{updateNote}</p> : null}
+        <button type="button" className="tool" onClick={onOpenLogs}>
+          <span className="tool-label">エラーログの保存先を開く</span>
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function HelpScreen() {
+  return (
+    <section className="page">
+      <h2>ヘルプ</h2>
+      <h3>基本操作</h3>
+      <p>PDF を選ぶか、画面へドロップして読み込みます。複数のときは選んだ順、またはドロップした順で、1 つの作業領域へページが並びます。サムネイルをドラッグして並べ替え、回転と削除は、そのページか選択全体に使います。書き出しは、全ページ、選択ページ、分割の 3 種類です。</p>
+      <h3>複数選択</h3>
+      <p>クリックで 1 ページを選びます。Ctrl+クリックで加えたり外したりします。Shift+クリックは、その範囲だけを選びます。Ctrl+A は、サムネイル一覧にフォーカスがあるとき全ページです。余白のクリック、または Esc で選択を解除します。</p>
+      <h3>分割</h3>
+      <p>隣り合うサムネイルのあいだをクリックすると分割線が入り、同じ場所をもう一度クリックすると外れます。複数列でも、現在ページ番号で隣り合う境目です。「すべての分割線を解除」は、それとは別の 1 操作です。分割の書き出しは、その線で分かれた PDF になります。</p>
+      <figure className="help-figure">
+        <span className="help-page">1</span>
+        <span className="help-page">2</span>
+        <span className="help-split" />
+        <span className="help-page">3</span>
+        <span className="help-page">4</span>
+      </figure>
+      <h3>ショートカット</h3>
+      <p>Delete で選択したページを削除します。Ctrl+Z で元に戻し、Ctrl+Y でやり直します。矢印キーでページを移動し、Shift+矢印で範囲を広げたり縮めたりします。Ctrl+ホイールで拡大縮小します。入力欄にフォーカスがあるときは、その欄の操作が優先されます。</p>
+    </section>
   );
 }
 
@@ -391,6 +557,13 @@ export function App() {
   const [session, setSession] = useState<SessionState>(emptySession);
   const [settings, setSettings] = useState<ViewSettings>(defaultSettings);
   const [settingsReady, setSettingsReady] = useState(false);
+  const [view, setView] = useState<AppView>(() => viewFromPath(window.location.pathname));
+  const [picking, setPicking] = useState(false);
+  const [held, setHeld] = useState<string[]>([]);
+  const [about, setAbout] = useState<{ name: string; version: string } | null>(null);
+  const [updateNote, setUpdateNote] = useState<string | null>(null);
+  const [iconsOnly, setIconsOnly] = useState(false);
+  const [overflow, setOverflow] = useState<string[]>([]);
   const [pdfs, setPdfs] = useState<Map<string, PDFDocumentProxy>>(new Map());
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -423,6 +596,8 @@ export function App() {
   const busyRef = useRef(busy);
   const resettingRef = useRef(false);
   const loadingRef = useRef(false);
+  const pickingRef = useRef(false);
+  const toolbarRef = useRef<HTMLElement>(null);
   const abortRef = useRef(false);
   const dialogRef = useRef<DialogState | null>(null);
   const namingRef = useRef<NamingState | null>(null);
@@ -447,6 +622,7 @@ export function App() {
   busyRef.current = busy;
   resettingRef.current = resetting;
   loadingRef.current = loading;
+  pickingRef.current = picking;
   dialogRef.current = dialog;
   namingRef.current = naming;
 
@@ -517,6 +693,42 @@ export function App() {
       activeRequest = false;
     };
   }, [token]);
+
+  useEffect(() => {
+    const onPop = () => setView(viewFromPath(window.location.pathname));
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, []);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    if (settings.theme === "light" || settings.theme === "dark") {
+      root.dataset.theme = settings.theme;
+    } else {
+      delete root.dataset.theme;
+    }
+  }, [settings.theme]);
+
+  useEffect(() => {
+    if (view !== "settings") {
+      return;
+    }
+    let live = true;
+    getAbout(token)
+      .then((next) => {
+        if (live) {
+          setAbout(next);
+        }
+      })
+      .catch((reason: unknown) => {
+        if (live) {
+          setError(reason instanceof Error ? reason.message : "バージョンを読めませんでした");
+        }
+      });
+    return () => {
+      live = false;
+    };
+  }, [token, view]);
 
   useEffect(() => {
     const node = workspaceRef.current;
@@ -828,14 +1040,23 @@ export function App() {
     }
   }
 
-  async function considerFile(file: File): Promise<"cancel" | "abort" | { id: string } | { error: string }> {
-    let intake: DocumentIntake;
-    try {
-      intake = await postDocument(token, file);
-    } catch (reason: unknown) {
-      const detail = reason instanceof Error ? reason.message : "読み込めませんでした";
-      return { error: detail };
+  function holdNotice(message: string) {
+    setHeld((current) => (current.includes(message) ? current : [...current, message]));
+  }
+
+  function openView(next: AppView) {
+    const path = next === "edit" ? "/" : `/${next}`;
+    if (window.location.pathname !== path) {
+      window.history.pushState(null, "", path);
     }
+    setView(next);
+  }
+
+  async function reviewIntake(
+    intake: DocumentIntake,
+    filename: string,
+    approved: string[],
+  ): Promise<"cancel" | "abort" | { id: string } | { error: string }> {
     if (abortRef.current) {
       await discardDocuments(token, [intake.document_id]);
       return "abort";
@@ -843,7 +1064,7 @@ export function App() {
     if (intake.needs_password) {
       const answer = await requestDialog({
         kind: "password",
-        filename: file.name,
+        filename,
         documentId: intake.document_id,
         error: null,
       });
@@ -865,10 +1086,17 @@ export function App() {
       await discardDocuments(token, [intake.document_id]);
       return "abort";
     }
+    let duplicate = false;
+    try {
+      duplicate = (await postDuplicate(token, intake.document_id, approved)).duplicate;
+    } catch (reason: unknown) {
+      await discardDocuments(token, [intake.document_id]);
+      return { error: reason instanceof Error ? reason.message : "重複を確認できませんでした" };
+    }
     if (intake.signed) {
       const answer = await requestDialog({
         kind: "confirm",
-        message: `${file.name} は電子署名 PDF です。編集して書き出すと、署名が有効でなくなる可能性があります。作業領域へ入れますか？`,
+        message: `${filename} は電子署名 PDF です。編集して書き出すと、署名が有効でなくなる可能性があります。作業領域へ入れますか？`,
         confirmLabel: "入れる",
       });
       if (answer !== "confirm") {
@@ -876,7 +1104,7 @@ export function App() {
         return answer === "cancel" ? "cancel" : "abort";
       }
     }
-    const prompt = largeMessage(file.name, intake);
+    const prompt = largeMessage(filename, intake);
     if (prompt) {
       const answer = await requestDialog({ kind: "confirm", message: prompt, confirmLabel: "入れる" });
       if (answer !== "confirm") {
@@ -884,10 +1112,10 @@ export function App() {
         return answer === "cancel" ? "cancel" : "abort";
       }
     }
-    if (intake.duplicate) {
+    if (duplicate) {
       const answer = await requestDialog({
         kind: "confirm",
-        message: `${file.name} は、同じ内容の PDF がすでにあります。追加しますか？`,
+        message: `${filename} は、同じ内容の PDF がすでにあります。追加しますか？`,
         confirmLabel: "追加する",
       });
       if (answer !== "confirm") {
@@ -899,7 +1127,7 @@ export function App() {
   }
 
   async function addFiles(files: File[]) {
-    if (loadingRef.current || busyRef.current || resettingRef.current || files.length === 0) {
+    if (loadingRef.current || busyRef.current || resettingRef.current || pickingRef.current || files.length === 0) {
       return;
     }
     loadingRef.current = true;
@@ -909,13 +1137,21 @@ export function App() {
     setSaved(null);
     setProgress(null);
     const accepted: string[] = [];
+    const approved: string[] = [];
     const failures: string[] = [];
     try {
       for (const file of files) {
         if (abortRef.current) {
           break;
         }
-        const outcome = await considerFile(file);
+        let intake: DocumentIntake;
+        try {
+          intake = await postDocument(token, file);
+        } catch (reason: unknown) {
+          failures.push(`${file.name}: ${reason instanceof Error ? reason.message : "読み込めませんでした"}`);
+          continue;
+        }
+        const outcome = await reviewIntake(intake, file.name, approved);
         if (outcome === "abort") {
           break;
         }
@@ -927,6 +1163,7 @@ export function App() {
           continue;
         }
         accepted.push(outcome.id);
+        approved.push(outcome.id);
       }
       if (abortRef.current) {
         if (accepted.length > 0) {
@@ -976,6 +1213,110 @@ export function App() {
     }
   }
 
+  async function pickPdfs() {
+    if (loadingRef.current || busyRef.current || resettingRef.current || dialogRef.current || pickingRef.current) {
+      return;
+    }
+    pickingRef.current = true;
+    setPicking(true);
+    setWaiting("ファイルを選択しています");
+    loadingRef.current = true;
+    abortRef.current = false;
+    setLoading(true);
+    const accepted: string[] = [];
+    const approved: string[] = [];
+    const failures: string[] = [];
+    try {
+      const opened = await postOpenPdfs(token);
+      if (opened.initial_folder_notice) {
+        holdNotice(opened.initial_folder_notice);
+      }
+      if (opened.status === "cancelled") {
+        return;
+      }
+      for (const item of opened.items ?? []) {
+        if (abortRef.current) {
+          break;
+        }
+        if (!isOpened(item)) {
+          failures.push(`${item.filename}: ${item.detail}`);
+          continue;
+        }
+        const outcome = await reviewIntake(item, item.filename, approved);
+        if (outcome === "abort") {
+          break;
+        }
+        if (outcome === "cancel") {
+          continue;
+        }
+        if ("error" in outcome) {
+          failures.push(`${item.filename}: ${outcome.error}`);
+          continue;
+        }
+        accepted.push(outcome.id);
+        approved.push(outcome.id);
+      }
+      if (failures.length > 0) {
+        for (const line of failures) {
+          holdNotice(line);
+        }
+      }
+      if (abortRef.current) {
+        if (accepted.length > 0) {
+          await discardDocuments(token, accepted);
+        }
+        return;
+      }
+      if (accepted.length === 0) {
+        return;
+      }
+      const ticket = ++ticketRef.current;
+      const next = await postCommand(token, { type: "append_documents", document_ids: accepted });
+      if (!publishSession(next, ticket)) {
+        return;
+      }
+      if (failures.length === 0) {
+        showToast(`${accepted.length}件の PDF を追加しました`);
+      }
+    } catch (reason: unknown) {
+      setError(reason instanceof Error ? reason.message : "ファイル選択を完了できませんでした");
+    } finally {
+      finishDialog("abort");
+      loadingRef.current = false;
+      abortRef.current = false;
+      pickingRef.current = false;
+      setLoading(false);
+      setPicking(false);
+      setWaiting(null);
+    }
+  }
+
+  async function resetSettings() {
+    const answer = await requestDialog({
+      kind: "confirm",
+      message: "設定を初期状態に戻しますか？",
+      confirmLabel: "初期状態に戻す",
+      enterConfirms: false,
+    });
+    if (answer !== "confirm") {
+      return;
+    }
+    try {
+      const next = await postSettingsReset(token);
+      setSettings(next);
+    } catch (reason: unknown) {
+      setError(reason instanceof Error ? reason.message : "設定を初期状態に戻せませんでした");
+    }
+  }
+
+  async function openLogs() {
+    try {
+      await postLogsOpen(token);
+    } catch (reason: unknown) {
+      setError(reason instanceof Error ? reason.message : "ログの保存先を開けませんでした");
+    }
+  }
+
   function onDragOver(event: DragEvent<HTMLDivElement>) {
     if (![...event.dataTransfer.types].includes("Files")) {
       return;
@@ -985,7 +1326,7 @@ export function App() {
 
   function onDrop(event: DragEvent<HTMLDivElement>) {
     event.preventDefault();
-    if (loadingRef.current || busyRef.current || resettingRef.current || dialogRef.current) {
+    if (loadingRef.current || busyRef.current || resettingRef.current || dialogRef.current || pickingRef.current) {
       return;
     }
     void addFiles([...event.dataTransfer.files]);
@@ -1038,6 +1379,9 @@ export function App() {
     setWaiting("保存先を選択しています");
     try {
       const started = await postExport(token);
+      if (started.initial_folder_notice) {
+        holdNotice(started.initial_folder_notice);
+      }
       if ("status" in started) {
         setWaiting(null);
         return;
@@ -1063,6 +1407,9 @@ export function App() {
     setWaiting("保存先を選択しています");
     try {
       const started = await postSelectionExport(token);
+      if (started.initial_folder_notice) {
+        holdNotice(started.initial_folder_notice);
+      }
       if ("status" in started) {
         setWaiting(null);
         return;
@@ -1098,6 +1445,9 @@ export function App() {
     setWaiting("保存先フォルダを選択しています");
     try {
       const started = await postSplit(token);
+      if (started.initial_folder_notice) {
+        holdNotice(started.initial_folder_notice);
+      }
       if (!mountedRef.current) {
         await postSplitCancel(token);
         return;
@@ -1261,12 +1611,14 @@ export function App() {
 
   const editLocked = resetting
     ? "新しく始めているため編集できません。"
-    : busy
-      ? "書き出し中は編集できません。"
-      : naming
-        ? "ファイル名の入力中は編集できません。"
-        : undefined;
-  const startFreshReason = loading
+    : picking
+      ? "ファイルの選択中は編集できません。"
+      : busy
+        ? "書き出し中は編集できません。"
+        : naming
+          ? "ファイル名の入力中は編集できません。"
+          : undefined;
+  const startFreshReason = loading || picking
     ? "読み込み中は新しく始められません。読み込みが終わると使えます。"
     : dialog
       ? "確認が終わるまで新しく始められません。"
@@ -1279,7 +1631,7 @@ export function App() {
           : resetting
             ? "新しく始めているため使えません。"
             : undefined;
-  const exportLocked = pages.length === 0 || busy || loading || naming !== null;
+  const exportLocked = pages.length === 0 || busy || loading || picking || naming !== null;
   const exportReason = pages.length === 0 ? noVisibleReason : editLocked;
   const selectionExportReason =
     exportReason ?? (session.selected_page_ids.length === 0 ? noPageReason : undefined);
@@ -1295,7 +1647,14 @@ export function App() {
         : selectPrompt;
 
   async function startFresh() {
-    if (resettingRef.current || loadingRef.current || busyRef.current || dialogRef.current || namingRef.current) {
+    if (
+      resettingRef.current ||
+      loadingRef.current ||
+      busyRef.current ||
+      dialogRef.current ||
+      namingRef.current ||
+      pickingRef.current
+    ) {
       return;
     }
     const message = startFreshConfirmMessage(sessionRef.current);
@@ -1310,7 +1669,7 @@ export function App() {
       if (answer !== "confirm") {
         return;
       }
-      if (loadingRef.current || busyRef.current || namingRef.current || resettingRef.current) {
+      if (loadingRef.current || busyRef.current || namingRef.current || resettingRef.current || pickingRef.current) {
         return;
       }
     }
@@ -1373,66 +1732,140 @@ export function App() {
     void runCommand({ type: "reorder", page_ids: pageIds, ...anchor });
   }
 
+  useLayoutEffect(() => {
+    const bar = toolbarRef.current;
+    if (!bar || view !== "edit") {
+      return;
+    }
+    const measure = () => {
+      const nodes = [...bar.querySelectorAll<HTMLElement>("[data-collapse]")];
+      const menu = bar.querySelector<HTMLElement>("[data-overflow-menu]");
+      bar.classList.remove("icons-only");
+      for (const node of nodes) {
+        node.hidden = false;
+      }
+      if (menu) {
+        menu.hidden = true;
+      }
+      let hideLabels = false;
+      const hidden: string[] = [];
+      if (bar.scrollWidth > bar.clientWidth + 1) {
+        hideLabels = true;
+        bar.classList.add("icons-only");
+        if (bar.scrollWidth > bar.clientWidth + 1) {
+          if (menu) {
+            menu.hidden = false;
+          }
+          for (const id of TOOLBAR_COLLAPSE_ORDER) {
+            const node = bar.querySelector<HTMLElement>(`[data-collapse="${id}"]`);
+            if (!node) {
+              continue;
+            }
+            node.hidden = true;
+            hidden.push(id);
+            if (bar.scrollWidth <= bar.clientWidth + 1) {
+              break;
+            }
+          }
+        }
+      }
+      setIconsOnly((current) => (current === hideLabels ? current : hideLabels));
+      setOverflow((current) => (current.join() === hidden.join() ? current : hidden));
+    };
+    measure();
+    const observer = new ResizeObserver(() => measure());
+    observer.observe(bar);
+    return () => observer.disconnect();
+  }, [view, loading, session.unsaved, session.split_unexported, settingsReady]);
+
+  const collapsed = new Set(overflow);
+
   return (
-    <div className="app" onDragOver={onDragOver} onDrop={onDrop}>
-      <header className="toolbar">
-        <h1>PDF 編集</h1>
-        <label className="file-button">
-          PDF を選ぶ
-          <input
-            type="file"
-            accept="application/pdf,.pdf"
-            multiple
-            disabled={loading || busy || dialog !== null}
-            onChange={(event) => {
-              const files = [...(event.target.files ?? [])];
-              event.target.value = "";
-              void addFiles(files);
-            }}
-          />
-        </label>
+    <div className="app">
+      <header className="chrome">
+        <nav className="nav">
+          <button type="button" className="tool nav-current" aria-current={view === "edit" ? "page" : undefined} onClick={() => openView("edit")}>
+            <span className="tool-label">PDF 編集</span>
+          </button>
+          <button type="button" className="tool" aria-current={view === "settings" ? "page" : undefined} onClick={() => openView("settings")}>
+            <span className="tool-label">設定</span>
+          </button>
+          <button type="button" className="tool" aria-current={view === "help" ? "page" : undefined} onClick={() => openView("help")}>
+            <span className="tool-label">ヘルプ</span>
+          </button>
+        </nav>
+      </header>
+      <div className="editor" hidden={view !== "edit"} onDragOver={onDragOver} onDrop={onDrop}>
+      <header className={iconsOnly ? "toolbar icons-only" : "toolbar"} ref={toolbarRef}>
+        <button
+          type="button"
+          className="tool"
+          disabled={loading || busy || picking || dialog !== null || resetting}
+          onClick={() => void pickPdfs()}
+        >
+          <span className="tool-label">PDF を選ぶ</span>
+        </button>
         {loading ? (
           <button type="button" onClick={abortLoading}>
             読み込みを中止
           </button>
         ) : null}
-        <TipButton
-          label="新しく始める"
-          warn
-          disabled={startFreshReason !== undefined}
-          reason={startFreshReason}
-          onClick={() => void startFresh()}
-        />
-        <TipButton
-          label="元に戻す"
-          disabled={Boolean(editLocked) || !session.undo_enabled}
-          title={editLocked ?? session.undo_hint}
-          onClick={() => void runCommand({ type: "undo" })}
-        />
-        <TipButton
-          label="やり直す"
-          disabled={Boolean(editLocked) || !session.redo_enabled}
-          title={editLocked ?? session.redo_hint}
-          onClick={() => void runCommand({ type: "redo" })}
-        />
-        <TipButton
-          label="左回転"
-          disabled={selectionReason !== undefined}
-          reason={selectionReason}
-          onClick={() => rotateSelection("left")}
-        />
-        <TipButton
-          label="右回転"
-          disabled={selectionReason !== undefined}
-          reason={selectionReason}
-          onClick={() => rotateSelection("right")}
-        />
-        <TipButton
-          label="削除"
-          disabled={selectionReason !== undefined}
-          reason={selectionReason}
-          onClick={deleteSelection}
-        />
+        <span data-collapse="start-fresh" hidden={collapsed.has("start-fresh")}>
+          <TipButton
+            label="新しく始める"
+            icon="start"
+            warn
+            disabled={startFreshReason !== undefined}
+            reason={startFreshReason}
+            onClick={() => void startFresh()}
+          />
+        </span>
+        <span data-collapse="undo" hidden={collapsed.has("undo")}>
+          <TipButton
+            label="元に戻す"
+            icon="undo"
+            disabled={Boolean(editLocked) || !session.undo_enabled}
+            title={editLocked ?? session.undo_hint}
+            onClick={() => void runCommand({ type: "undo" })}
+          />
+        </span>
+        <span data-collapse="redo" hidden={collapsed.has("redo")}>
+          <TipButton
+            label="やり直す"
+            icon="redo"
+            disabled={Boolean(editLocked) || !session.redo_enabled}
+            title={editLocked ?? session.redo_hint}
+            onClick={() => void runCommand({ type: "redo" })}
+          />
+        </span>
+        <span data-collapse="rotate-left" hidden={collapsed.has("rotate-left")}>
+          <TipButton
+            label="左回転"
+            icon="left"
+            disabled={selectionReason !== undefined}
+            reason={selectionReason}
+            onClick={() => rotateSelection("left")}
+          />
+        </span>
+        <span data-collapse="rotate-right" hidden={collapsed.has("rotate-right")}>
+          <TipButton
+            label="右回転"
+            icon="right"
+            disabled={selectionReason !== undefined}
+            reason={selectionReason}
+            onClick={() => rotateSelection("right")}
+          />
+        </span>
+        <span data-collapse="delete" hidden={collapsed.has("delete")}>
+          <TipButton
+            label="削除"
+            icon="trash"
+            warn
+            disabled={selectionReason !== undefined}
+            reason={selectionReason}
+            onClick={deleteSelection}
+          />
+        </span>
         <form className="jump" onSubmit={(event) => event.preventDefault()}>
           <input
             aria-label="移動先のページ番号"
@@ -1473,47 +1906,97 @@ export function App() {
         <TipButton label="−" disabled={zoomOutReason !== undefined} reason={zoomOutReason} onClick={() => stepZoom(-1)} />
         <TipButton label="＋" disabled={zoomInReason !== undefined} reason={zoomInReason} onClick={() => stepZoom(1)} />
         <span className="zoom-label">{metrics && active ? formatPercent(metrics.effective) : ""}</span>
-        <TipButton
-          label="横一列"
-          pressed={settings.thumbnail_layout === "row"}
-          disabled={!settingsReady}
-          reason="設定の読み込みが終わると使えます。"
-          onClick={() => chooseLayout("row")}
-        />
-        <TipButton
-          label="複数列"
-          pressed={settings.thumbnail_layout === "grid"}
-          disabled={!settingsReady}
-          reason="設定の読み込みが終わると使えます。"
-          onClick={() => chooseLayout("grid")}
-        />
-        <TipButton
-          label="小"
-          pressed={settings.thumbnail_size === "small"}
-          disabled={!settingsReady}
-          reason="設定の読み込みが終わると使えます。"
-          onClick={() => chooseSize("small")}
-        />
-        <TipButton
-          label="中"
-          pressed={settings.thumbnail_size === "medium"}
-          disabled={!settingsReady}
-          reason="設定の読み込みが終わると使えます。"
-          onClick={() => chooseSize("medium")}
-        />
-        <TipButton
-          label="大"
-          pressed={settings.thumbnail_size === "large"}
-          disabled={!settingsReady}
-          reason="設定の読み込みが終わると使えます。"
-          onClick={() => chooseSize("large")}
-        />
-        <TipButton
-          label="すべての分割線を解除"
-          disabled={clearSplitsReason !== undefined}
-          reason={clearSplitsReason}
-          onClick={() => void runCommand({ type: "clear_all_splits" })}
-        />
+        <span className="tool-group" data-collapse="layout" hidden={collapsed.has("layout")}>
+          <TipButton
+            label="横一列"
+            icon="row"
+            pressed={settings.thumbnail_layout === "row"}
+            disabled={!settingsReady}
+            reason="設定の読み込みが終わると使えます。"
+            onClick={() => chooseLayout("row")}
+          />
+          <TipButton
+            label="複数列"
+            icon="grid"
+            pressed={settings.thumbnail_layout === "grid"}
+            disabled={!settingsReady}
+            reason="設定の読み込みが終わると使えます。"
+            onClick={() => chooseLayout("grid")}
+          />
+          <TipButton
+            label="小"
+            pressed={settings.thumbnail_size === "small"}
+            disabled={!settingsReady}
+            reason="設定の読み込みが終わると使えます。"
+            onClick={() => chooseSize("small")}
+          />
+          <TipButton
+            label="中"
+            pressed={settings.thumbnail_size === "medium"}
+            disabled={!settingsReady}
+            reason="設定の読み込みが終わると使えます。"
+            onClick={() => chooseSize("medium")}
+          />
+          <TipButton
+            label="大"
+            pressed={settings.thumbnail_size === "large"}
+            disabled={!settingsReady}
+            reason="設定の読み込みが終わると使えます。"
+            onClick={() => chooseSize("large")}
+          />
+        </span>
+        <span data-collapse="clear-splits" hidden={collapsed.has("clear-splits")}>
+          <TipButton
+            label="すべての分割線を解除"
+            icon="clear"
+            disabled={clearSplitsReason !== undefined}
+            reason={clearSplitsReason}
+            onClick={() => void runCommand({ type: "clear_all_splits" })}
+          />
+        </span>
+        <details className="overflow-menu" data-overflow-menu hidden={overflow.length === 0}>
+          <summary aria-label="その他の操作">...</summary>
+          <div className="menu-panel">
+            {collapsed.has("start-fresh") ? (
+              <button type="button" disabled={startFreshReason !== undefined} onClick={() => void startFresh()}>
+                新しく始める
+              </button>
+            ) : null}
+            {collapsed.has("layout") ? (
+              <>
+                <button type="button" disabled={!settingsReady} onClick={() => chooseLayout("row")}>横一列</button>
+                <button type="button" disabled={!settingsReady} onClick={() => chooseLayout("grid")}>複数列</button>
+                <button type="button" disabled={!settingsReady} onClick={() => chooseSize("small")}>小</button>
+                <button type="button" disabled={!settingsReady} onClick={() => chooseSize("medium")}>中</button>
+                <button type="button" disabled={!settingsReady} onClick={() => chooseSize("large")}>大</button>
+              </>
+            ) : null}
+            {collapsed.has("clear-splits") ? (
+              <button type="button" disabled={clearSplitsReason !== undefined} onClick={() => void runCommand({ type: "clear_all_splits" })}>
+                すべての分割線を解除
+              </button>
+            ) : null}
+            {collapsed.has("redo") ? (
+              <button type="button" disabled={Boolean(editLocked) || !session.redo_enabled} onClick={() => void runCommand({ type: "redo" })}>
+                やり直す
+              </button>
+            ) : null}
+            {collapsed.has("undo") ? (
+              <button type="button" disabled={Boolean(editLocked) || !session.undo_enabled} onClick={() => void runCommand({ type: "undo" })}>
+                元に戻す
+              </button>
+            ) : null}
+            {collapsed.has("rotate-left") ? (
+              <button type="button" disabled={selectionReason !== undefined} onClick={() => rotateSelection("left")}>左回転</button>
+            ) : null}
+            {collapsed.has("rotate-right") ? (
+              <button type="button" disabled={selectionReason !== undefined} onClick={() => rotateSelection("right")}>右回転</button>
+            ) : null}
+            {collapsed.has("delete") ? (
+              <button type="button" disabled={selectionReason !== undefined} onClick={deleteSelection}>削除</button>
+            ) : null}
+          </div>
+        </details>
         {session.unsaved ? (
           <button type="button" disabled={exportLocked} title={exportReason} onClick={() => void exportAll()}>
             未保存
@@ -1571,6 +2054,14 @@ export function App() {
           総ページ数 {pages.length}　選択ページ数 {session.selected_page_ids.length}　元 PDF 数 {session.documents.length}
         </span>
       </header>
+      {held.map((message) => (
+        <p className="notice" key={message}>
+          {message}
+          <button type="button" onClick={() => setHeld((current) => current.filter((item) => item !== message))}>
+            閉じる
+          </button>
+        </p>
+      ))}
       {error ? (
         <p className="notice">
           {error}
@@ -1678,6 +2169,22 @@ export function App() {
           ) : null}
         </section>
       </div>
+      </div>
+      {view === "settings" ? (
+        <SettingsScreen
+          settings={settings}
+          ready={settingsReady}
+          about={about}
+          updateNote={updateNote}
+          onTheme={(theme) => void saveSettings({ ...settings, theme })}
+          onNotifications={(enabled) => void saveSettings({ ...settings, windows_notifications: enabled })}
+          onIdle={(minutes) => void saveSettings({ ...settings, idle_minutes: minutes })}
+          onReset={() => void resetSettings()}
+          onOpenLogs={() => void openLogs()}
+          onCheckUpdates={() => setUpdateNote("更新確認先はまだ決まっていません。")}
+        />
+      ) : null}
+      {view === "help" ? <HelpScreen /> : null}
       {dialog?.kind === "password" ? (
         <PasswordDialog
           key={dialog.documentId}

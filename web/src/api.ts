@@ -4,6 +4,7 @@ import type {
   EditCommand,
   ExportJob,
   ExportStart,
+  OpenPdfsResult,
   SessionState,
   SplitBegin,
   ViewSettings,
@@ -46,11 +47,55 @@ export function getSettings(token: string): Promise<ViewSettings> {
 }
 
 export function putSettings(token: string, settings: ViewSettings): Promise<ViewSettings> {
+  const body = {
+    thumbnail_layout: settings.thumbnail_layout,
+    thumbnail_size: settings.thumbnail_size,
+    pane_ratio: settings.pane_ratio,
+    theme: settings.theme,
+    windows_notifications: settings.windows_notifications,
+    idle_minutes: settings.idle_minutes,
+  };
   return request(token, "/api/settings", {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(settings),
+    body: JSON.stringify(body),
   }).then((response) => readJson<ViewSettings>(response));
+}
+
+export function postSettingsReset(token: string): Promise<ViewSettings> {
+  return request(token, "/api/settings/reset", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  }).then((response) => readJson<ViewSettings>(response));
+}
+
+export function postOpenPdfs(token: string): Promise<OpenPdfsResult> {
+  return request(token, "/api/dialogs/open-pdfs", { method: "POST" }).then((response) =>
+    readJson<OpenPdfsResult>(response),
+  );
+}
+
+export function postDuplicate(
+  token: string,
+  documentId: string,
+  approvedDocumentIds: string[],
+): Promise<{ duplicate: boolean }> {
+  return request(token, `/api/documents/${documentId}/duplicate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ approved_document_ids: approvedDocumentIds }),
+  }).then((response) => readJson<{ duplicate: boolean }>(response));
+}
+
+export function getAbout(token: string): Promise<{ name: string; version: string }> {
+  return request(token, "/api/about").then((response) => readJson<{ name: string; version: string }>(response));
+}
+
+export function postLogsOpen(token: string): Promise<{ status: string }> {
+  return request(token, "/api/logs/open", { method: "POST" }).then((response) =>
+    readJson<{ status: string }>(response),
+  );
 }
 
 export function postCommand(token: string, command: EditCommand): Promise<CommandResult> {

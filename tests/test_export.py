@@ -1,3 +1,4 @@
+import json
 import threading
 import time
 from pathlib import Path
@@ -6,6 +7,7 @@ import pikepdf
 import pytest
 from fastapi.testclient import TestClient
 
+from app.folders import FOLDER_NOTICE
 from app.main import create_app
 from app.save_dialog import documents_folder
 from app.session import Activity, Session
@@ -24,7 +26,7 @@ def write_pdf(path: Path, pages: int) -> None:
 @pytest.fixture
 def env(tmp_path):
     session = Session(temp_dir=tmp_path / "pdf-editor")
-    app = create_app(session)
+    app = create_app(session, settings_path=tmp_path / "settings.json")
     with TestClient(app) as client:
         yield client, app, session
 
@@ -962,3 +964,156 @@ def test_failed_split_transition_drops_naming(env, tmp_path):
     edited = post_command(client, app, {"type": "clear_split", "after_page_id": ids[0]})
     assert edited.status_code == 200
     assert edited.json()["split_positions"] == []
+
+
+def test_unusable_save_folder_notifies_and_successful_jobs_remember_parent(env, tmp_path):
+    client, app, _session = env
+    source = tmp_path / "sample.pdf"
+    write_pdf(source, pages=2)
+    loaded = load_pdf(client, app, source)
+    missing = tmp_path / "missing-save"
+    app.state.settings.path.write_text(json.dumps({"last_save_dir": str(missing)}), encoding="utf-8")
+    seen: dict[str, Path] = {}
+
+    def ask(initial: Path, _name: str):
+        seen["initial"] = initial
+        return None
+
+    app.state.exporter.ask_save_path = ask
+    cancelled = post_export(client, app)
+    assert cancelled.status_code == 200
+    assert cancelled.json()["status"] == "cancelled"
+    assert cancelled.json()["initial_folder_notice"] == FOLDER_NOTICE
+    assert seen["initial"] == documents_folder()
+    assert app.state.settings.read()["last_save_dir"] == str(missing)
+
+    destination = tmp_path / "saved"
+    destination.mkdir()
+    app.state.exporter.ask_save_path = lambda initial, _name: destination / "out.pdf"
+    started = post_export(client, app)
+    assert started.status_code == 200
+    assert started.json()["initial_folder_notice"] == FOLDER_NOTICE
+    assert app.state.settings.read()["last_save_dir"] == str(destination)
+    wait_job(client, app, started.json()["job_id"])
+
+    page_id = visible_ids(loaded)[0]
+    assert patch_selection(client, app, [page_id], page_id).status_code == 200
+    selected_dir = tmp_path / "selected"
+    selected_dir.mkdir()
+    app.state.settings.path.write_text(json.dumps({"last_save_dir": str(missing)}), encoding="utf-8")
+    app.state.exporter.ask_save_path = lambda initial, _name: selected_dir / "pages.pdf"
+    selection = client.post("/api/exports/selection", headers=auth(app))
+    assert selection.status_code == 200
+    assert selection.json()["initial_folder_notice"] == FOLDER_NOTICE
+    assert app.state.settings.read()["last_save_dir"] == str(selected_dir)
+    wait_job(client, app, selection.json()["job_id"])
+
+
+def test_split_remembers_chosen_folder_only_when_the_job_starts(env, tmp_path):
+    client, app, _session = env
+    source = tmp_path / "sample.pdf"
+    write_pdf(source, pages=2)
+    loaded = load_pdf(client, app, source)
+    ids = visible_ids(loaded)
+    assert post_command(client, app, {"type": "set_split", "after_page_id": ids[0]}).status_code == 200
+    missing = tmp_path / "missing-split"
+    app.state.settings.path.write_text(json.dumps({"last_save_dir": str(missing)}), encoding="utf-8")
+    folder = tmp_path / "parts"
+    folder.mkdir()
+    seen: dict[str, Path] = {}
+
+    def ask(initial: Path):
+        seen["initial"] = initial
+        return None
+
+    app.state.exporter.ask_folder = ask
+    cancelled = post_split(client, app)
+    assert cancelled.json()["status"] == "cancelled"
+    assert cancelled.json()["initial_folder_notice"] == FOLDER_NOTICE
+    assert seen["initial"] == documents_folder()
+    assert app.state.settings.read()["last_save_dir"] == str(missing)
+
+    app.state.exporter.ask_folder = lambda _initial: folder
+    naming = post_split(client, app)
+    assert naming.json()["status"] == "naming"
+    assert naming.json()["initial_folder_notice"] == FOLDER_NOTICE
+    assert app.state.settings.read()["last_save_dir"] == str(missing)
+    assert post_cancel(client, app).json()["status"] == "cancelled"
+    assert app.state.settings.read()["last_save_dir"] == str(missing)
+
+    app.state.exporter.ask_folder = lambda _initial: folder
+    started = post_split(client, app)
+    assert started.json()["status"] == "naming"
+    confirmed = post_confirm(client, app, ["sample_1.pdf", "sample_2.pdf"])
+    assert confirmed.status_code == 200
+    assert app.state.settings.read()["last_save_dir"] == str(folder)
+    wait_job(client, app, confirmed.json()["job_id"])
+
+
+def test_windows_notification_runs_only_when_a_job_finishes_and_setting_is_on(env, tmp_path):
+    client, app, _session = env
+    source = tmp_path / "sample.pdf"
+    write_pdf(source, pages=1)
+    load_pdf(client, app, source)
+    destination = tmp_path / "out"
+    destination.mkdir()
+    calls: list[tuple[str, str]] = []
+    app.state.exporter.show_notification = lambda title, body: calls.append((title, body))
+    app.state.exporter.ask_save_path = lambda _directory, _name: None
+
+    assert post_export(client, app).json()["status"] == "cancelled"
+    assert calls == []
+
+    started_flag = threading.Event()
+    release = threading.Event()
+
+    def pause() -> None:
+        started_flag.set()
+        release.wait(5)
+
+    app.state.exporter.ask_save_path = lambda _directory, _name: destination / "out.pdf"
+    app.state.exporter.pause_during_copy = pause
+    started = post_export(client, app)
+    assert started_flag.wait(5)
+    during = client.get(f"/api/exports/{started.json()['job_id']}", headers=auth(app))
+    assert during.status_code == 200
+    assert calls == []
+    release.set()
+    job = wait_job(client, app, started.json()["job_id"])
+    assert job["stage"] == "completed"
+    wait_calls(calls, [("PDF編集", "書き出しが完了しました")])
+    assert str(destination) not in calls[0][1]
+    assert "out.pdf" not in calls[0][1]
+
+    calls.clear()
+    app.state.exporter.enough_space = lambda _directory, _required: False
+    app.state.exporter.pause_during_copy = None
+    failed = post_export(client, app)
+    failed_job = wait_job(client, app, failed.json()["job_id"])
+    assert failed_job["stage"] == "failed"
+    wait_calls(calls, [("PDF編集", "書き出しに失敗しました")])
+    assert str(destination) not in calls[0][1]
+
+    calls.clear()
+    app.state.exporter.enough_space = lambda _directory, _required: True
+    turned_off = {
+        "thumbnail_layout": "row",
+        "thumbnail_size": "medium",
+        "pane_ratio": None,
+        "theme": None,
+        "windows_notifications": False,
+        "idle_minutes": 120,
+    }
+    assert client.put("/api/settings", headers=auth(app), json=turned_off).status_code == 200
+    quiet = post_export(client, app)
+    assert wait_job(client, app, quiet.json()["job_id"])["stage"] == "completed"
+    time.sleep(0.2)
+    assert calls == []
+
+
+def wait_calls(seen: list[tuple[str, str]], expected: list[tuple[str, str]]) -> None:
+    for _ in range(50):
+        if seen == expected:
+            return
+        time.sleep(0.05)
+    assert seen == expected

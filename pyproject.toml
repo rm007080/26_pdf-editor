@@ -11,6 +11,7 @@ dependencies = [
     "uvicorn==0.54.0",
     "pikepdf==10.13.0.post1",
     "python-multipart==0.0.32",
+    "winotify==1.1.0",
 ]
 
 [project.optional-dependencies]

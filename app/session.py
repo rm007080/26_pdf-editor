@@ -883,8 +883,21 @@ class Session:
         try:
             if self.pause_during_load is not None:
                 self.pause_during_load()
-            prepared = self._prepare_upload(data, filename)
-            stored = self._store_intake(prepared)
+            return self.receive_bytes(data, filename, hold=Activity.LOADING)
+        finally:
+            self.finish(Activity.LOADING)
+
+    def receive_bytes(
+        self,
+        data: bytes,
+        filename: str,
+        *,
+        hold: Activity,
+        exclude_ids: set[str] | None = None,
+    ) -> tuple[int, dict]:
+        try:
+            prepared = self._prepare_upload(data, filename, exclude_ids=exclude_ids or set())
+            stored = self._store_intake(prepared, hold=hold)
             if stored is None:
                 if prepared["owns_file"]:
                     prepared["path"].unlink(missing_ok=True)
@@ -892,8 +905,29 @@ class Session:
             return 200, stored
         except LoadError as exc:
             return 400, {"detail": str(exc)}
-        finally:
-            self.finish(Activity.LOADING)
+
+    def duplicate_against(self, document_id: str, body: object) -> tuple[int, dict]:
+        if not isinstance(body, dict) or set(body) != {"approved_document_ids"}:
+            return 400, {"detail": "重複の指定が不正です"}
+        approved = body["approved_document_ids"]
+        if not isinstance(approved, list) or any(not isinstance(item, str) for item in approved):
+            return 400, {"detail": "重複の指定が不正です"}
+        approved_ids = set(approved)
+        with self._lock:
+            intake = self._intakes.get(document_id)
+            if intake is None:
+                return 400, {"detail": "受け取っていない PDF です"}
+            if intake["needs_password"]:
+                return 400, {"detail": "パスワードの確認が終わっていない受け取りです"}
+            digest = self._hashes[document_id]
+            workspace = self._workspace_ids()
+            duplicate = any(
+                other_id != document_id
+                and existing == digest
+                and (other_id in workspace or other_id in approved_ids)
+                for other_id, existing in self._hashes.items()
+            )
+            return 200, {"duplicate": duplicate}
 
     def submit_password(self, document_id: str, body: object) -> tuple[int, dict]:
         if not isinstance(body, dict) or set(body) != {"password"} or not isinstance(body.get("password"), str):
@@ -969,11 +1003,11 @@ class Session:
         if previous != chosen and not self._referenced(previous):
             previous.unlink(missing_ok=True)
 
-    def _store_intake(self, prepared: dict[str, object]) -> dict[str, object] | None:
+    def _store_intake(self, prepared: dict[str, object], hold: Activity = Activity.LOADING) -> dict[str, object] | None:
         if self.before_commit is not None:
             self.before_commit()
         with self._lock:
-            if self._activity is not Activity.LOADING:
+            if self._activity is not hold:
                 return None
             document_id = uuid4().hex
             self._intakes[document_id] = {
@@ -988,7 +1022,9 @@ class Session:
             self._hashes[document_id] = prepared["digest"]
             return self._intake_payload(document_id)
 
-    def _prepare_upload(self, data: bytes, filename: str) -> dict[str, object]:
+    def _prepare_upload(
+        self, data: bytes, filename: str, exclude_ids: set[str] | None = None
+    ) -> dict[str, object]:
         safe_name = Path(filename).name
         if not safe_name.lower().endswith(".pdf"):
             raise LoadError("PDF 以外のファイルは読み込めません")
@@ -1002,7 +1038,7 @@ class Session:
                 signed = _is_signed(pdf)
         except pikepdf.PasswordError:
             with self._lock:
-                duplicate = self._is_duplicate(digest)
+                duplicate = self._is_duplicate(digest, exclude_ids)
             return {
                 "filename": safe_name,
                 "path": staging,
@@ -1021,7 +1057,7 @@ class Session:
             staging.unlink(missing_ok=True)
             raise
         with self._lock:
-            duplicate = self._is_duplicate(digest)
+            duplicate = self._is_duplicate(digest, exclude_ids)
             shared = self._plain_path(digest)
         path = staging
         owns_file = True
@@ -1052,10 +1088,11 @@ class Session:
             "duplicate": bool(intake["duplicate"]),
         }
 
-    def _is_duplicate(self, digest: str) -> bool:
+    def _is_duplicate(self, digest: str, exclude_ids: set[str] | None = None) -> bool:
+        excluded = exclude_ids or set()
         workspace = self._workspace_ids()
         for document_id, existing in self._hashes.items():
-            if existing != digest:
+            if document_id in excluded or existing != digest:
                 continue
             if document_id in workspace or document_id in self._intakes:
                 return True

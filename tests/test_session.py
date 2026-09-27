@@ -80,7 +80,7 @@ def stored_copies(session: Session) -> dict[str, bytes]:
 @pytest.fixture
 def env(tmp_path):
     session = Session(temp_dir=tmp_path / "pdf-editor")
-    app = create_app(session)
+    app = create_app(session, settings_path=tmp_path / "settings.json")
     with TestClient(app) as client:
         yield client, app, session
 

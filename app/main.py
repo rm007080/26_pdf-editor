@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -9,8 +10,12 @@ from fastapi.staticfiles import StaticFiles
 
 from app.auth import bearer_matches, new_token
 from app.export import ExportService
+from app.log_store import LogStore
+from app.open_pdfs import open_selected_pdfs
+from app.save_dialog import ask_open_pdfs
 from app.session import Session
 from app.settings import SettingsStore
+from app.version import read_app_version
 
 DIST_DIR = Path(__file__).resolve().parent.parent / "web" / "dist"
 DIST_INDEX = DIST_DIR / "index.html"
@@ -48,9 +53,14 @@ def render_index(token: str) -> str:
     return html.replace(TOKEN_PLACEHOLDER, token)
 
 
-def create_app(session: Session | None = None, settings_path: Path | None = None) -> FastAPI:
+def create_app(
+    session: Session | None = None,
+    settings_path: Path | None = None,
+    log_dir: Path | None = None,
+) -> FastAPI:
     session = session or Session()
     settings = SettingsStore(settings_path)
+    logs = LogStore(log_dir)
     development = _development_enabled()
 
     @asynccontextmanager
@@ -64,9 +74,13 @@ def create_app(session: Session | None = None, settings_path: Path | None = None
         redoc_url=None,
         openapi_url="/openapi.json" if development else None,
     )
-    exporter = ExportService(session)
+    exporter = ExportService(session, settings)
     app.state.session = session
     app.state.exporter = exporter
+    app.state.settings = settings
+    app.state.logs = logs
+    app.state.ask_open_pdfs = ask_open_pdfs
+    app.state.version = read_app_version()
     app.state.token = new_token()
 
     @app.middleware("http")
@@ -78,8 +92,24 @@ def create_app(session: Session | None = None, settings_path: Path | None = None
         return await call_next(request)
 
     @app.get("/", response_class=HTMLResponse)
+    @app.get("/settings", response_class=HTMLResponse)
+    @app.get("/help", response_class=HTMLResponse)
     def index() -> str:
         return render_index(app.state.token)
+
+    @app.get("/api/about")
+    def get_about() -> dict:
+        return {"name": "PDF編集", "version": app.state.version}
+
+    @app.post("/api/logs/open")
+    def post_logs_open() -> dict:
+        logs.open()
+        return {"status": "opened"}
+
+    @app.post("/api/dialogs/open-pdfs")
+    async def post_open_pdfs() -> JSONResponse:
+        status, body = await open_selected_pdfs(session, settings, app.state.ask_open_pdfs)
+        return JSONResponse(status_code=status, content=body)
 
     @app.get("/api/settings")
     def get_settings() -> dict:
@@ -92,6 +122,18 @@ def create_app(session: Session | None = None, settings_path: Path | None = None
             return error
         status, payload = settings.write(body)
         return JSONResponse(status_code=status, content=payload)
+
+    @app.post("/api/settings/reset")
+    async def post_settings_reset(request: Request) -> JSONResponse:
+        raw = await request.body()
+        if raw.strip() not in {b"", b"{}"}:
+            try:
+                body = json.loads(raw)
+            except json.JSONDecodeError:
+                return JSONResponse(status_code=400, content={"detail": "設定の指定が不正です"})
+            if body != {}:
+                return JSONResponse(status_code=400, content={"detail": "設定の指定が不正です"})
+        return JSONResponse(status_code=200, content=settings.reset())
 
     @app.get("/api/session")
     def get_session() -> dict:
@@ -124,6 +166,14 @@ def create_app(session: Session | None = None, settings_path: Path | None = None
         filename = file.filename or ""
         status, body = await asyncio.to_thread(session.accept_upload, data, filename)
         return JSONResponse(status_code=status, content=body)
+
+    @app.post("/api/documents/{document_id}/duplicate")
+    async def post_document_duplicate(document_id: str, request: Request) -> JSONResponse:
+        body, error = await read_json_body(request, "重複の指定が不正です")
+        if error is not None:
+            return error
+        status, payload = session.duplicate_against(document_id, body)
+        return JSONResponse(status_code=status, content=payload)
 
     @app.post("/api/documents/{document_id}/password")
     async def post_document_password(document_id: str, request: Request) -> JSONResponse:

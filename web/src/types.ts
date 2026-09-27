@@ -53,11 +53,31 @@ export type EditCommand =
 
 export type ThumbnailLayout = "row" | "grid";
 export type ThumbnailSize = "small" | "medium" | "large";
+export type ThemeChoice = "light" | "dark" | null;
+export type IdleMinutes = 30 | 60 | 120 | 240;
 
 export type ViewSettings = {
   thumbnail_layout: ThumbnailLayout;
   thumbnail_size: ThumbnailSize;
   pane_ratio: number | null;
+  theme: ThemeChoice;
+  windows_notifications: boolean;
+  idle_minutes: IdleMinutes;
+  last_open_dir: string | null;
+  last_save_dir: string | null;
+};
+
+export type OpenedDocument = DocumentIntake & { filename: string };
+
+export type RejectedDocument = {
+  filename: string;
+  detail: string;
+};
+
+export type OpenPdfsResult = {
+  status: "ok" | "cancelled";
+  items?: Array<OpenedDocument | RejectedDocument>;
+  initial_folder_notice?: string;
 };
 
 export type ExportStage = "copying" | "verifying" | "committing" | "completed" | "failed";
@@ -74,8 +94,8 @@ export type ExportJob = {
 };
 
 export type ExportStart =
-  | { status: "cancelled" }
-  | { job_id: string };
+  | { status: "cancelled"; initial_folder_notice?: string }
+  | { job_id: string; initial_folder_notice?: string };
 
 export type SplitFileProposal = {
   name: string;
@@ -83,5 +103,5 @@ export type SplitFileProposal = {
 };
 
 export type SplitBegin =
-  | { status: "cancelled" }
-  | { status: "naming"; files: SplitFileProposal[] };
+  | { status: "cancelled"; initial_folder_notice?: string }
+  | { status: "naming"; files: SplitFileProposal[]; initial_folder_notice?: string };
