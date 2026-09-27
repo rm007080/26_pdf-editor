@@ -13,6 +13,7 @@ import {
   postExport,
   postPassword,
   postSelectionExport,
+  postSessionReset,
   postSplit,
   postSplitCancel,
   postSplitConfirm,
@@ -73,6 +74,19 @@ const defaultSettings: ViewSettings = {
   pane_ratio: null,
 };
 
+function startFreshConfirmMessage(current: { unsaved: boolean; split_unexported: boolean }): string | null {
+  if (current.unsaved && current.split_unexported) {
+    return "未保存の変更と、まだ書き出していない分割設定があります。破棄して新しく始めますか？";
+  }
+  if (current.unsaved) {
+    return "未保存の変更があります。破棄して新しく始めますか？";
+  }
+  if (current.split_unexported) {
+    return "まだ書き出していない分割設定があります。破棄して新しく始めますか？";
+  }
+  return null;
+}
+
 const selectPrompt = "ページを選択してください";
 const noPageReason = "ページが選択されていないため使えません。ページを選択すると使えます。";
 const noVisibleReason = "見えているページがないため書き出せません。";
@@ -108,7 +122,7 @@ const BYTE_LIMIT = 100 * 1024 * 1024;
 
 type DialogState =
   | { kind: "password"; filename: string; documentId: string; error: string | null }
-  | { kind: "confirm"; message: string; confirmLabel: string };
+  | { kind: "confirm"; message: string; confirmLabel: string; enterConfirms?: boolean; warn?: boolean };
 
 type DialogAnswer = DocumentIntake | "confirm" | "cancel" | "abort" | { failed: string };
 
@@ -220,45 +234,62 @@ function PasswordDialog({
 function ConfirmDialog({
   message,
   confirmLabel,
+  enterConfirms = true,
+  warn = false,
   onConfirm,
   onCancel,
 }: {
   message: string;
   confirmLabel: string;
+  enterConfirms?: boolean;
+  warn?: boolean;
   onConfirm: () => void;
   onCancel: () => void;
 }) {
   const confirmRef = useRef<HTMLButtonElement>(null);
+  const formRef = useRef<HTMLFormElement>(null);
   useEffect(() => {
-    confirmRef.current?.focus();
-  }, []);
+    if (enterConfirms) {
+      confirmRef.current?.focus();
+      return;
+    }
+    formRef.current?.focus();
+  }, [enterConfirms]);
   return (
     <div className="modal-backdrop">
       <form
+        ref={formRef}
         className="modal"
         role="dialog"
         aria-modal="true"
+        tabIndex={-1}
         onSubmit={(event) => {
           event.preventDefault();
-          onConfirm();
+          if (enterConfirms) {
+            onConfirm();
+          }
         }}
-        onKeyDown={(event) => {
+        onKeyDownCapture={(event) => {
           if (event.key === "Escape") {
             event.preventDefault();
             event.stopPropagation();
             onCancel();
             return;
           }
-          if (event.key === "Enter") {
+          if (event.key === "Enter" && !enterConfirms) {
             event.preventDefault();
             event.stopPropagation();
-            onConfirm();
           }
         }}
       >
         <p>{message}</p>
         <div className="modal-actions">
-          <button type="submit" ref={confirmRef}>
+          <button
+            type={enterConfirms ? "submit" : "button"}
+            className={warn ? "warn-button" : undefined}
+            ref={confirmRef}
+            onClick={enterConfirms ? undefined : onConfirm}
+          >
             {confirmLabel}
           </button>
           <button type="button" onClick={onCancel}>
@@ -329,6 +360,7 @@ function TipButton({
   reason,
   title,
   pressed,
+  warn,
   onClick,
 }: {
   label: string;
@@ -336,11 +368,18 @@ function TipButton({
   reason?: string;
   title?: string;
   pressed?: boolean;
+  warn?: boolean;
   onClick: () => void;
 }) {
   return (
     <span className="tip" title={title ?? (disabled ? reason : undefined)}>
-      <button type="button" disabled={disabled} aria-pressed={pressed} onClick={onClick}>
+      <button
+        type="button"
+        className={warn ? "warn-button" : undefined}
+        disabled={disabled}
+        aria-pressed={pressed}
+        onClick={onClick}
+      >
         {label}
       </button>
     </span>
@@ -362,6 +401,7 @@ export function App() {
   const [naming, setNaming] = useState<NamingState | null>(null);
   const [namingError, setNamingError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [resetting, setResetting] = useState(false);
   const [jumpText, setJumpText] = useState("");
   const [moveText, setMoveText] = useState("");
   const [toast, setToast] = useState<string | null>(null);
@@ -381,6 +421,7 @@ export function App() {
   const settingsRef = useRef(settings);
   const columnsRef = useRef(columns);
   const busyRef = useRef(busy);
+  const resettingRef = useRef(false);
   const loadingRef = useRef(false);
   const abortRef = useRef(false);
   const dialogRef = useRef<DialogState | null>(null);
@@ -404,6 +445,7 @@ export function App() {
   settingsRef.current = settings;
   columnsRef.current = columns;
   busyRef.current = busy;
+  resettingRef.current = resetting;
   loadingRef.current = loading;
   dialogRef.current = dialog;
   namingRef.current = naming;
@@ -556,6 +598,9 @@ export function App() {
   }
 
   async function applySelection(next: PageSelection, keepAnchor = false): Promise<boolean> {
+    if (resettingRef.current) {
+      return false;
+    }
     const ticket = ++ticketRef.current;
     try {
       const updated = await patchSelection(token, next.selected_page_ids, next.active_page_id);
@@ -570,7 +615,7 @@ export function App() {
   }
 
   async function runCommand(command: EditCommand) {
-    if (busyRef.current || namingRef.current) {
+    if (busyRef.current || namingRef.current || resettingRef.current) {
       return;
     }
     setRemovedCount(null);
@@ -638,10 +683,14 @@ export function App() {
       if (dialogRef.current || namingRef.current) {
         if (event.key === "Escape") {
           event.preventDefault();
+          const current = dialogRef.current;
+          if (current?.kind === "confirm" && current.enterConfirms === false) {
+            finishDialog("cancel");
+          }
         }
         return;
       }
-      if (isTextField(event.target) || busyRef.current) {
+      if (isTextField(event.target) || busyRef.current || resettingRef.current) {
         return;
       }
       if (event.ctrlKey && !event.altKey && event.key.toLowerCase() === "z") {
@@ -850,7 +899,7 @@ export function App() {
   }
 
   async function addFiles(files: File[]) {
-    if (loadingRef.current || busyRef.current || files.length === 0) {
+    if (loadingRef.current || busyRef.current || resettingRef.current || files.length === 0) {
       return;
     }
     loadingRef.current = true;
@@ -936,7 +985,7 @@ export function App() {
 
   function onDrop(event: DragEvent<HTMLDivElement>) {
     event.preventDefault();
-    if (loadingRef.current || busyRef.current || dialogRef.current) {
+    if (loadingRef.current || busyRef.current || resettingRef.current || dialogRef.current) {
       return;
     }
     void addFiles([...event.dataTransfer.files]);
@@ -1210,11 +1259,26 @@ export function App() {
       ? "400%より大きくできないため使えません。400%より小さい表示のときに使えます。"
       : undefined;
 
-  const editLocked = busy
-    ? "書き出し中は編集できません。"
-    : naming
-      ? "ファイル名の入力中は編集できません。"
-      : undefined;
+  const editLocked = resetting
+    ? "新しく始めているため編集できません。"
+    : busy
+      ? "書き出し中は編集できません。"
+      : naming
+        ? "ファイル名の入力中は編集できません。"
+        : undefined;
+  const startFreshReason = loading
+    ? "読み込み中は新しく始められません。読み込みが終わると使えます。"
+    : dialog
+      ? "確認が終わるまで新しく始められません。"
+      : naming
+        ? "ファイル名の確定中は新しく始められません。確定が終わると使えます。"
+        : busy
+          ? waiting
+            ? "保存先の選択中は新しく始められません。選択が終わると使えます。"
+            : "書き出し中は新しく始められません。書き出しが終わると使えます。"
+          : resetting
+            ? "新しく始めているため使えません。"
+            : undefined;
   const exportLocked = pages.length === 0 || busy || loading || naming !== null;
   const exportReason = pages.length === 0 ? noVisibleReason : editLocked;
   const selectionExportReason =
@@ -1229,6 +1293,51 @@ export function App() {
       : active
         ? null
         : selectPrompt;
+
+  async function startFresh() {
+    if (resettingRef.current || loadingRef.current || busyRef.current || dialogRef.current || namingRef.current) {
+      return;
+    }
+    const message = startFreshConfirmMessage(sessionRef.current);
+    if (message) {
+      const answer = await requestDialog({
+        kind: "confirm",
+        message,
+        confirmLabel: "破棄して新しく始める",
+        enterConfirms: false,
+        warn: true,
+      });
+      if (answer !== "confirm") {
+        return;
+      }
+      if (loadingRef.current || busyRef.current || namingRef.current || resettingRef.current) {
+        return;
+      }
+    }
+    resettingRef.current = true;
+    setResetting(true);
+    try {
+      const next = await postSessionReset(token);
+      const ticket = ++ticketRef.current;
+      publishSession(next, ticket);
+      setSaved(null);
+      setProgress(null);
+      setWaiting(null);
+      setRemovedCount(null);
+      setError(null);
+      setToast(null);
+      window.clearTimeout(toastTimer.current);
+    } catch (reason: unknown) {
+      if (reason instanceof ApiError && reason.status === 409) {
+        setError(reason.message);
+        return;
+      }
+      setError(reason instanceof Error ? reason.message : "新しく始められませんでした");
+    } finally {
+      resettingRef.current = false;
+      setResetting(false);
+    }
+  }
 
   function rotateSelection(direction: "left" | "right") {
     const ids = sessionRef.current.selected_page_ids;
@@ -1287,6 +1396,13 @@ export function App() {
             読み込みを中止
           </button>
         ) : null}
+        <TipButton
+          label="新しく始める"
+          warn
+          disabled={startFreshReason !== undefined}
+          reason={startFreshReason}
+          onClick={() => void startFresh()}
+        />
         <TipButton
           label="元に戻す"
           disabled={Boolean(editLocked) || !session.undo_enabled}
@@ -1595,6 +1711,8 @@ export function App() {
         <ConfirmDialog
           message={dialog.message}
           confirmLabel={dialog.confirmLabel}
+          enterConfirms={dialog.enterConfirms}
+          warn={dialog.warn}
           onConfirm={() => finishDialog("confirm")}
           onCancel={() => finishDialog("cancel")}
         />

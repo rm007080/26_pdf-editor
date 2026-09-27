@@ -105,6 +105,11 @@ def create_app(session: Session | None = None, settings_path: Path | None = None
         status, payload = session.update_selection(body)
         return JSONResponse(status_code=status, content=payload)
 
+    @app.post("/api/session/reset")
+    async def post_session_reset() -> JSONResponse:
+        status, payload = await asyncio.to_thread(session.reset)
+        return JSONResponse(status_code=status, content=payload)
+
     @app.post("/api/session/commands")
     async def post_commands(request: Request) -> JSONResponse:
         body, error = await read_json_body(request, "コマンドの指定が不正です")

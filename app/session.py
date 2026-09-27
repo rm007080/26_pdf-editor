@@ -39,6 +39,7 @@ class Activity(Enum):
     LOADING = "loading"
     DIALOG = "dialog"
     EXPORTING = "exporting"
+    RESETTING = "resetting"
 
 
 class Session:
@@ -61,6 +62,7 @@ class Session:
         self._split_positions: list[int] = []
         self._split_exported: list[frozenset[str]] | None = None
         self.pause_during_load = None
+        self.pause_during_reset = None
         self.before_commit = None
         self.fail_decrypt_save = None
         self._assign_selection([], None)
@@ -70,20 +72,44 @@ class Session:
             shutil.rmtree(self.temp_dir)
         self.temp_dir.mkdir(parents=True)
         with self._lock:
-            self.documents = []
-            self.pages = []
-            self._assign_selection([], None)
-            self._undo = []
-            self._redo = []
-            self._history_drop_notified = False
-            self._intakes = {}
-            self._copies = {}
-            self._hashes = {}
-            self._catalog = {}
-            self._baseline = []
-            self._split_positions = []
-            self._split_exported = None
+            self._clear_workspace_unlocked()
             self._activity = Activity.IDLE
+
+    def reset(self) -> tuple[int, dict]:
+        with self._lock:
+            if self._activity is not Activity.IDLE:
+                return 409, {"detail": "読み込み中、ダイアログ中、または書き出し中のため新しく始められません"}
+            self._activity = Activity.RESETTING
+        try:
+            if self.pause_during_reset is not None:
+                self.pause_during_reset()
+            if self.temp_dir.exists():
+                shutil.rmtree(self.temp_dir)
+            self.temp_dir.mkdir(parents=True)
+        except Exception:
+            with self._lock:
+                if self._activity is Activity.RESETTING:
+                    self._activity = Activity.IDLE
+            raise
+        with self._lock:
+            self._clear_workspace_unlocked()
+            self._activity = Activity.IDLE
+            return 200, self._snapshot_unlocked()
+
+    def _clear_workspace_unlocked(self) -> None:
+        self.documents = []
+        self.pages = []
+        self._assign_selection([], None)
+        self._undo = []
+        self._redo = []
+        self._history_drop_notified = False
+        self._intakes = {}
+        self._copies = {}
+        self._hashes = {}
+        self._catalog = {}
+        self._baseline = []
+        self._split_positions = []
+        self._split_exported = None
 
     def shutdown(self) -> None:
         if self.temp_dir.exists():

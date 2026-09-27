@@ -1745,3 +1745,225 @@ def test_append_undo_restores_split_positions_around_reorder(env, tmp_path):
     redone_move = post_command(client, app, {"type": "redo"})
     assert redone_move.json()["split_positions"] == [2]
     assert visible_ids(redone_move.json())[:2] == added
+
+
+def post_reset(client: TestClient, app, headers=None):
+    return client.post(
+        "/api/session/reset",
+        headers=auth(app) if headers is None else headers,
+    )
+
+
+def test_reset_clears_workspace_without_undo_or_startup(env, tmp_path):
+    client, app, session = env
+    source = tmp_path / "sample.pdf"
+    write_pdf(source, pages=2)
+    original = source.read_bytes()
+    loaded = load_pdf(client, app, source)
+    page_id = loaded["pages"][0]["id"]
+    rotated = post_command(client, app, {"type": "rotate", "page_ids": [page_id], "direction": "right"})
+    assert rotated.status_code == 200
+    assert rotated.json()["unsaved"] is True
+    assert rotated.json()["undo_enabled"] is True
+    split = post_command(client, app, {"type": "set_split", "after_page_id": page_id})
+    assert split.json()["split_unexported"] is True
+    document_id = loaded["documents"][0]["id"]
+    assert client.get(f"/api/session/files/{document_id}", headers=auth(app)).status_code == 200
+    startup_calls: list[str] = []
+
+    def refuse_startup() -> None:
+        startup_calls.append("startup")
+        raise AssertionError("reset は startup を呼ばない")
+
+    session.startup = refuse_startup  # type: ignore[method-assign]
+
+    response = post_reset(client, app)
+
+    assert response.status_code == 200
+    assert startup_calls == []
+    assert response.json() == {
+        "documents": [],
+        "pages": [],
+        "selected_page_ids": [],
+        "active_page_id": None,
+        "undo_enabled": False,
+        "redo_enabled": False,
+        "undo_hint": "元に戻せる操作がありません。実行しても状態は変わりません",
+        "redo_hint": "やり直せる操作がありません。実行しても状態は変わりません",
+        "unsaved": False,
+        "split_positions": [],
+        "split_unexported": False,
+    }
+    assert "cleared_leftover" not in response.json()
+    assert client.get("/api/session", headers=auth(app)).json() == response.json()
+    assert list(session.temp_dir.iterdir()) == []
+    assert client.get(f"/api/session/files/{document_id}", headers=auth(app)).status_code == 404
+    undone = post_command(client, app, {"type": "undo"})
+    assert undone.status_code == 400
+    assert client.get("/api/session", headers=auth(app)).json()["pages"] == []
+    assert source.read_bytes() == original
+
+
+def test_reset_of_empty_workspace_returns_empty_session(env):
+    client, app, session = env
+
+    response = post_reset(client, app)
+
+    assert response.status_code == 200
+    assert response.json() == client.get("/api/session", headers=auth(app)).json()
+    assert response.json()["documents"] == []
+    assert response.json()["unsaved"] is False
+    assert response.json()["split_unexported"] is False
+    assert session.temp_dir.is_dir()
+    assert list(session.temp_dir.iterdir()) == []
+
+
+def test_reset_without_token_is_rejected(env, tmp_path):
+    client, app, _session = env
+    source = tmp_path / "sample.pdf"
+    write_pdf(source, pages=1)
+    load_pdf(client, app, source)
+    before = client.get("/api/session", headers=auth(app)).json()
+
+    response = post_reset(client, app, headers={})
+
+    assert response.status_code == 401
+    assert client.get("/api/session", headers=auth(app)).json() == before
+
+
+def test_reset_command_does_not_clear_workspace(env, tmp_path):
+    client, app, _session = env
+    source = tmp_path / "sample.pdf"
+    write_pdf(source, pages=1)
+    loaded = load_pdf(client, app, source)
+    page_id = loaded["pages"][0]["id"]
+    assert post_command(client, app, {"type": "rotate", "page_ids": [page_id], "direction": "right"}).status_code == 200
+    before = client.get("/api/session", headers=auth(app)).json()
+
+    response = post_command(client, app, {"type": "reset"})
+
+    assert response.status_code == 400
+    assert client.get("/api/session", headers=auth(app)).json() == before
+
+
+def test_reset_discards_intake_outside_workspace(env, tmp_path):
+    client, app, session = env
+    source = tmp_path / "sample.pdf"
+    locked = tmp_path / "locked.pdf"
+    write_pdf(source, pages=1)
+    write_encrypted_pdf(locked)
+    kept = load_pdf(client, app, source)
+    pending = post_file(client, app, locked)
+    assert pending.status_code == 200
+    assert pending.json()["needs_password"] is True
+    document_id = pending.json()["document_id"]
+    assert list(session.temp_dir.iterdir())
+
+    response = post_reset(client, app)
+
+    assert response.status_code == 200
+    assert response.json()["documents"] == []
+    assert response.json()["pages"] == []
+    assert list(session.temp_dir.iterdir()) == []
+    refused = post_command(client, app, {"type": "append_documents", "document_ids": [document_id]})
+    assert refused.status_code == 400
+    assert post_password(client, app, document_id, "secret").status_code == 400
+    assert client.get("/api/session", headers=auth(app)).json()["documents"] == []
+    assert kept["documents"][0]["id"] not in {item["id"] for item in response.json()["documents"]}
+
+
+@pytest.mark.parametrize("activity", [Activity.LOADING, Activity.DIALOG, Activity.EXPORTING])
+def test_reset_conflicts_while_busy(env, tmp_path, activity):
+    client, app, session = env
+    source = tmp_path / "sample.pdf"
+    write_pdf(source, pages=1)
+    load_pdf(client, app, source)
+    before = client.get("/api/session", headers=auth(app)).json()
+    copies = stored_copies(session)
+    assert session.try_begin(activity)
+
+    response = post_reset(client, app)
+
+    assert response.status_code == 409
+    assert client.get("/api/session", headers=auth(app)).json() == before
+    assert stored_copies(session) == copies
+    session.finish(activity)
+    assert post_reset(client, app).status_code == 200
+
+
+def test_reset_conflicts_while_loading_without_clearing_copies(env, tmp_path):
+    client, app, session = env
+    source = tmp_path / "sample.pdf"
+    incoming = tmp_path / "incoming.pdf"
+    write_pdf(source, pages=1)
+    write_pdf(incoming, pages=1)
+    load_pdf(client, app, source)
+    before = client.get("/api/session", headers=auth(app)).json()
+    copies = stored_copies(session)
+    started = threading.Event()
+    release = threading.Event()
+
+    def pause() -> None:
+        started.set()
+        assert release.wait(5)
+
+    session.pause_during_load = pause
+    result: dict[str, object] = {}
+
+    def load_incoming() -> None:
+        result["response"] = post_file(client, app, incoming)
+
+    worker = threading.Thread(target=load_incoming)
+    worker.start()
+    assert started.wait(5)
+    conflict = post_reset(client, app)
+    during = client.get("/api/session", headers=auth(app)).json()
+    during_copies = stored_copies(session)
+    release.set()
+    worker.join(5)
+
+    assert conflict.status_code == 409
+    assert during == before
+    assert during_copies == copies
+    assert result["response"].status_code == 200
+    assert client.get("/api/session", headers=auth(app)).json() == before
+
+
+def test_second_reset_conflicts_until_the_first_finishes(env, tmp_path):
+    client, app, session = env
+    source = tmp_path / "sample.pdf"
+    write_pdf(source, pages=1)
+    load_pdf(client, app, source)
+    before = client.get("/api/session", headers=auth(app)).json()
+    copies = stored_copies(session)
+    started = threading.Event()
+    release = threading.Event()
+
+    def pause() -> None:
+        started.set()
+        assert release.wait(5)
+
+    session.pause_during_reset = pause
+    result: dict[str, object] = {}
+
+    def run_reset() -> None:
+        result["response"] = post_reset(client, app)
+
+    worker = threading.Thread(target=run_reset)
+    worker.start()
+    assert started.wait(5)
+    conflict = post_reset(client, app)
+    during = client.get("/api/session", headers=auth(app)).json()
+    during_copies = stored_copies(session)
+    release.set()
+    worker.join(5)
+
+    assert conflict.status_code == 409
+    assert during == before
+    assert during_copies == copies
+    assert worker.is_alive() is False
+    assert result["response"].status_code == 200
+    assert result["response"].json()["documents"] == []
+    assert result["response"].json()["unsaved"] is False
+    assert list(session.temp_dir.iterdir()) == []
+    assert post_reset(client, app).status_code == 200

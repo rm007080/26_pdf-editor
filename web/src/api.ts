@@ -77,6 +77,12 @@ export function getSession(token: string): Promise<SessionState> {
   return request(token, "/api/session").then((response) => readJson<SessionState>(response));
 }
 
+export function postSessionReset(token: string): Promise<SessionState> {
+  return request(token, "/api/session/reset", { method: "POST" }).then((response) =>
+    readJson<SessionState>(response),
+  );
+}
+
 export function postDocument(token: string, file: File): Promise<DocumentIntake> {
   const body = new FormData();
   body.append("file", file);

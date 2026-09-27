@@ -95,6 +95,12 @@ input {
   cursor: not-allowed;
 }
 
+.toolbar button.warn-button,
+.modal button.warn-button {
+  background: #8a2e16;
+  color: #fff8f3;
+}
+
 .tip {
   display: inline-flex;
 }
