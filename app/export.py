@@ -17,10 +17,19 @@ class ExportFailure(Exception):
 
 
 class Job:
-    def __init__(self, job_id: str, requested: Path, page_plan: list[tuple[int, int]]) -> None:
+    def __init__(
+        self,
+        job_id: str,
+        requested: Path,
+        page_plan: list[tuple[str, int, int]],
+        sources: dict[str, Path],
+        required_bytes: int,
+    ) -> None:
         self.id = job_id
         self.requested = requested
         self.page_plan = page_plan
+        self.sources = sources
+        self.required_bytes = required_bytes
         self.stage = "copying"
         self.processed_pages = 0
         self.total_pages = len(page_plan)
@@ -47,7 +56,7 @@ class ExportService:
         if plan is None:
             self.session.finish(Activity.DIALOG)
             return 400, {"detail": "書き出すページがありません"}
-        initial_dir, initial_name, pages = plan
+        initial_dir, initial_name, pages, required_bytes, sources = plan
         try:
             chosen = await asyncio.to_thread(self.ask_save_path, initial_dir, initial_name)
         except Exception:
@@ -56,7 +65,7 @@ class ExportService:
         if chosen is None:
             self.session.finish(Activity.DIALOG)
             return 200, {"status": "cancelled"}
-        job_id = self._create_job(Path(chosen), pages)
+        job_id = self._create_job(Path(chosen), pages, sources, required_bytes)
         if not self.session.transition(Activity.DIALOG, Activity.EXPORTING):
             self.session.finish(Activity.DIALOG)
             return 409, {"detail": "書き出しを開始できませんでした"}
@@ -100,16 +109,13 @@ class ExportService:
     def run_job(self, job_id: str) -> None:
         temp_path: Path | None = None
         try:
-            requested, total, pages = self._job_plan(job_id)
+            requested, total, pages, sources, required_bytes = self._job_plan(job_id)
             self._update(job_id, stage="copying")
-            source = self.session.session_file_path()
-            if source is None:
-                raise ExportFailure("読み込まれた PDF がありません")
             final = avoid_collision(requested)
-            if not self.enough_space(final.parent, source.stat().st_size):
+            if not self.enough_space(final.parent, required_bytes):
                 raise ExportFailure("空き容量が足りません")
             temp_path = final.with_name(f".{final.name}.{job_id}.part")
-            self._copy_pages(source, temp_path, pages, job_id)
+            self._copy_pages(sources, temp_path, pages, job_id)
             self._update(job_id, stage="verifying")
             if self.page_count(temp_path) != total:
                 raise ExportFailure("書き出した PDF のページ数が一致しません")
@@ -117,6 +123,7 @@ class ExportService:
             final = avoid_collision(requested)
             os.replace(temp_path, final)
             temp_path = None
+            self.session.mark_saved(pages)
             self._update(job_id, stage="completed", path=final, processed_pages=total)
         except Exception as exc:
             if temp_path is not None:
@@ -126,26 +133,32 @@ class ExportService:
         finally:
             self.session.finish(Activity.EXPORTING)
 
-    def _plan(self) -> tuple[Path, str, list[tuple[int, int]]] | None:
-        snapshot = self.session.snapshot()
-        pages = [page for page in snapshot["pages"] if not page["deleted"]]
-        pages.sort(key=lambda page: page["order"])
-        if not snapshot["documents"] or not pages:
+    def _plan(
+        self,
+    ) -> tuple[Path, str, list[tuple[str, int, int]], int, dict[str, Path]] | None:
+        ready = self.session.export_plan()
+        if ready is None:
             return None
-        filename = initial_filename(snapshot["documents"][0]["filename"])
-        page_plan = [(int(page["source_page"]), int(page["rotation"])) for page in pages]
-        return documents_folder(), filename, page_plan
+        pages = list(ready["pages"])
+        sources = dict(ready["paths"])
+        return documents_folder(), initial_filename(str(ready["filename"])), pages, int(ready["bytes"]), sources
 
-    def _create_job(self, requested: Path, pages: list[tuple[int, int]]) -> str:
+    def _create_job(
+        self,
+        requested: Path,
+        pages: list[tuple[str, int, int]],
+        sources: dict[str, Path],
+        required_bytes: int,
+    ) -> str:
         job_id = uuid4().hex
         with self._lock:
-            self._jobs[job_id] = Job(job_id, requested, pages)
+            self._jobs[job_id] = Job(job_id, requested, pages, sources, required_bytes)
         return job_id
 
-    def _job_plan(self, job_id: str) -> tuple[Path, int, list[tuple[int, int]]]:
+    def _job_plan(self, job_id: str) -> tuple[Path, int, list[tuple[str, int, int]], dict[str, Path], int]:
         with self._lock:
             job = self._jobs[job_id]
-            return job.requested, job.total_pages, list(job.page_plan)
+            return job.requested, job.total_pages, list(job.page_plan), dict(job.sources), job.required_bytes
 
     def _update(self, job_id: str, **changes) -> None:
         with self._lock:
@@ -153,17 +166,29 @@ class ExportService:
             for key, value in changes.items():
                 setattr(job, key, value)
 
-    def _copy_pages(self, source: Path, temp_path: Path, pages: list[tuple[int, int]], job_id: str) -> None:
-        with pikepdf.open(source) as src:
+    def _copy_pages(
+        self,
+        sources: dict[str, Path],
+        temp_path: Path,
+        pages: list[tuple[str, int, int]],
+        job_id: str,
+    ) -> None:
+        opened: dict[str, pikepdf.Pdf] = {}
+        try:
             if self.pause_during_copy is not None:
                 self.pause_during_copy()
             output = pikepdf.Pdf.new()
-            for index, (source_page, rotation) in enumerate(pages, start=1):
-                output.pages.append(src.pages[source_page - 1])
+            for index, (document_id, source_page, rotation) in enumerate(pages, start=1):
+                if document_id not in opened:
+                    opened[document_id] = pikepdf.open(sources[document_id])
+                output.pages.append(opened[document_id].pages[source_page - 1])
                 if rotation % 360:
                     output.pages[-1].rotate(rotation % 360, relative=True)
                 self._update(job_id, processed_pages=index)
             output.save(temp_path)
+        finally:
+            for src in opened.values():
+                src.close()
 
     def _completed_path(self, job_id: str) -> Path | None:
         with self._lock:

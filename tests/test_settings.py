@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from app.main import create_app
 from app.session import Session
 from app.settings import default_settings_path
-from tests.test_session import auth, post_file, write_pdf
+from tests.test_session import auth, load_pdf, write_pdf
 
 
 def test_default_path_uses_localappdata(monkeypatch, tmp_path):
@@ -75,7 +75,7 @@ def test_put_settings_writes_file_and_leaves_session(env, tmp_path):
     client, app, _session, path = env
     source = tmp_path / "sample.pdf"
     write_pdf(source, pages=2)
-    assert post_file(client, app, source).status_code == 200
+    load_pdf(client, app, source)
     before = client.get("/api/session", headers=auth(app)).json()
     body = {"thumbnail_layout": "grid", "thumbnail_size": "large", "pane_ratio": 0.25}
 
@@ -122,7 +122,7 @@ def test_settings_work_while_exporting(env, tmp_path):
     client, app, _session, path = env
     source = tmp_path / "sample.pdf"
     write_pdf(source, pages=1)
-    assert post_file(client, app, source).status_code == 200
+    load_pdf(client, app, source)
     before = client.get("/api/session", headers=auth(app)).json()
     destination = tmp_path / "out"
     destination.mkdir()

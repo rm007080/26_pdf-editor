@@ -21,6 +21,7 @@ export type SessionState = {
   redo_enabled: boolean;
   undo_hint: string;
   redo_hint: string;
+  unsaved: boolean;
 };
 
 export type CommandResult = SessionState & {
@@ -32,6 +33,7 @@ export type EditCommand =
   | { type: "rotate"; page_ids: string[]; direction: "left" | "right" }
   | { type: "delete"; page_ids: string[] }
   | { type: "reorder"; page_ids: string[]; before_page_id?: string; after_page_id?: string }
+  | { type: "append_documents"; document_ids: string[] }
   | { type: "undo" }
   | { type: "redo" };
 

@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type PointerEvent as ReactPointerEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type FormEvent, type PointerEvent as ReactPointerEvent } from "react";
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import {
   ApiError,
+  discardDocuments,
   getExportJob,
   getSession,
   getSettings,
@@ -14,7 +15,7 @@ import {
   readToken,
 } from "./api";
 import { FRAME_HEIGHT, SPLITTER, oneRowHeight, paneHeights, ratioFromThumb } from "./panes";
-import { openSessionPdf } from "./pdf";
+import { openDocumentPdf } from "./pdf";
 import { ThumbnailStrip, ZoomPreview, cancelThumbnailDrag, visiblePages } from "./Preview";
 import {
   clearSelection,
@@ -48,6 +49,7 @@ const emptySession: SessionState = {
   redo_enabled: false,
   undo_hint: "元に戻せる操作がありません。実行しても状態は変わりません",
   redo_hint: "やり直せる操作がありません。実行しても状態は変わりません",
+  unsaved: false,
 };
 
 const defaultSettings: ViewSettings = {
@@ -108,8 +110,9 @@ export function App() {
   const [session, setSession] = useState<SessionState>(emptySession);
   const [settings, setSettings] = useState<ViewSettings>(defaultSettings);
   const [settingsReady, setSettingsReady] = useState(false);
-  const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
+  const [pdfs, setPdfs] = useState<Map<string, PDFDocumentProxy>>(new Map());
   const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
   const [waiting, setWaiting] = useState<string | null>(null);
   const [progress, setProgress] = useState<ExportJob | null>(null);
   const [saved, setSaved] = useState<{ jobId: string; path: string } | null>(null);
@@ -133,6 +136,9 @@ export function App() {
   const settingsRef = useRef(settings);
   const columnsRef = useRef(columns);
   const busyRef = useRef(busy);
+  const loadingRef = useRef(false);
+  const abortRef = useRef(false);
+  const pdfsRef = useRef<Map<string, PDFDocumentProxy>>(new Map());
   const toastTimer = useRef(0);
   zoomRef.current = zoom;
   metricsRef.current = metrics;
@@ -140,6 +146,7 @@ export function App() {
   settingsRef.current = settings;
   columnsRef.current = columns;
   busyRef.current = busy;
+  loadingRef.current = loading;
 
   const pages = visiblePages(session.pages);
   const names = useMemo(
@@ -147,7 +154,8 @@ export function App() {
     [session.documents],
   );
   const active = pages.find((page) => page.id === session.active_page_id) ?? null;
-  const documentId = session.documents[0]?.id ?? "";
+  const activePdf = active ? (pdfs.get(active.document_id) ?? null) : null;
+  const documentKey = session.documents.map((document) => document.id).join("\n");
   const frameHeight = FRAME_HEIGHT[settings.thumbnail_size];
   const available = Math.max(0, workspaceHeight - SPLITTER);
   const heights = paneHeights(available, dragRatio ?? settings.pane_ratio, oneRowHeight(settings.thumbnail_size));
@@ -207,31 +215,54 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    if (!documentId) {
-      setPdf(null);
-      return;
+    const wanted = documentKey ? documentKey.split("\n") : [];
+    const wantedSet = new Set(wanted);
+    const current = pdfsRef.current;
+    let removed = false;
+    for (const [id, pdf] of [...current.entries()]) {
+      if (!wantedSet.has(id)) {
+        void pdf.destroy();
+        current.delete(id);
+        removed = true;
+      }
     }
-    let activeRequest = true;
-    let loaded: PDFDocumentProxy | null = null;
-    openSessionPdf(token)
-      .then((document) => {
-        if (!activeRequest) {
-          void document.destroy();
-          return;
+    if (removed) {
+      setPdfs(new Map(current));
+    }
+    let cancelled = false;
+    void (async () => {
+      for (const id of wanted) {
+        if (cancelled || current.has(id)) {
+          continue;
         }
-        loaded = document;
-        setPdf(document);
-      })
-      .catch((reason: unknown) => {
-        if (activeRequest) {
-          setError(reason instanceof Error ? reason.message : "PDF を表示できませんでした");
+        try {
+          const pdf = await openDocumentPdf(token, id);
+          if (cancelled || !sessionRef.current.documents.some((document) => document.id === id)) {
+            void pdf.destroy();
+            continue;
+          }
+          current.set(id, pdf);
+          setPdfs(new Map(current));
+        } catch (reason: unknown) {
+          if (!cancelled) {
+            setError(reason instanceof Error ? reason.message : "PDF を表示できませんでした");
+          }
         }
-      });
+      }
+    })();
     return () => {
-      activeRequest = false;
-      void loaded?.destroy();
+      cancelled = true;
     };
-  }, [token, documentId]);
+  }, [token, documentKey]);
+
+  useEffect(() => {
+    return () => {
+      for (const pdf of pdfsRef.current.values()) {
+        void pdf.destroy();
+      }
+      pdfsRef.current.clear();
+    };
+  }, []);
 
   function publishSession(updated: SessionState, ticket: number, keepAnchor = false): boolean {
     if (ticket !== ticketRef.current) {
@@ -422,20 +453,85 @@ export function App() {
     return () => window.removeEventListener("wheel", onWheel);
   }, [token]);
 
-  async function chooseFile(file: File | undefined) {
-    if (!file) {
+  async function addFiles(files: File[]) {
+    if (loadingRef.current || busyRef.current || files.length === 0) {
       return;
     }
+    loadingRef.current = true;
+    abortRef.current = false;
+    setLoading(true);
     setError(null);
     setSaved(null);
     setProgress(null);
+    const received: string[] = [];
+    const failures: string[] = [];
     try {
+      for (const file of files) {
+        if (abortRef.current) {
+          break;
+        }
+        try {
+          const result = await postDocument(token, file);
+          received.push(result.document_id);
+        } catch (reason: unknown) {
+          const detail = reason instanceof Error ? reason.message : "読み込めませんでした";
+          failures.push(`${file.name}: ${detail}`);
+        }
+      }
+      if (abortRef.current) {
+        if (received.length > 0) {
+          await discardDocuments(token, received);
+        }
+        return;
+      }
+      if (received.length === 0) {
+        if (failures.length > 0) {
+          setError(failures.join("\n"));
+        }
+        return;
+      }
       const ticket = ++ticketRef.current;
-      const next = await postDocument(token, file);
-      publishSession(next, ticket);
+      const next = await postCommand(token, { type: "append_documents", document_ids: received });
+      if (!publishSession(next, ticket)) {
+        return;
+      }
+      if (failures.length > 0) {
+        setError(failures.join("\n"));
+      } else {
+        showToast(`${received.length}件の PDF を追加しました`);
+      }
     } catch (reason: unknown) {
-      setError(reason instanceof Error ? reason.message : "読み込めませんでした");
+      const message = reason instanceof Error ? reason.message : "読み込めませんでした";
+      if (!abortRef.current && received.length > 0) {
+        try {
+          await discardDocuments(token, received);
+        } catch (discardReason: unknown) {
+          const extra = discardReason instanceof Error ? discardReason.message : "受け取った PDF を破棄できませんでした";
+          setError(`${message}\n${extra}`);
+          return;
+        }
+      }
+      setError(message);
+    } finally {
+      loadingRef.current = false;
+      abortRef.current = false;
+      setLoading(false);
     }
+  }
+
+  function onDragOver(event: DragEvent<HTMLDivElement>) {
+    if (![...event.dataTransfer.types].includes("Files")) {
+      return;
+    }
+    event.preventDefault();
+  }
+
+  function onDrop(event: DragEvent<HTMLDivElement>) {
+    event.preventDefault();
+    if (loadingRef.current || busyRef.current) {
+      return;
+    }
+    void addFiles([...event.dataTransfer.files]);
   }
 
   async function openResult(kind: "open-file" | "open-folder") {
@@ -473,6 +569,9 @@ export function App() {
         setError(job.detail ?? "書き出しに失敗しました");
         return;
       }
+      const latest = await getSession(token);
+      setSession(latest);
+      anchorRef.current = latest.active_page_id;
       if (job.path) {
         setSaved({ jobId: job.job_id, path: job.path });
       }
@@ -627,7 +726,7 @@ export function App() {
   }
 
   return (
-    <div className="app">
+    <div className="app" onDragOver={onDragOver} onDrop={onDrop}>
       <header className="toolbar">
         <h1>PDF 編集</h1>
         <label className="file-button">
@@ -635,13 +734,20 @@ export function App() {
           <input
             type="file"
             accept="application/pdf,.pdf"
+            multiple
+            disabled={loading || busy}
             onChange={(event) => {
-              const file = event.target.files?.[0];
+              const files = [...(event.target.files ?? [])];
               event.target.value = "";
-              void chooseFile(file);
+              void addFiles(files);
             }}
           />
         </label>
+        {loading ? (
+          <button type="button" onClick={() => (abortRef.current = true)}>
+            読み込みを中止
+          </button>
+        ) : null}
         <TipButton
           label="元に戻す"
           disabled={Boolean(editLocked) || !session.undo_enabled}
@@ -747,10 +853,20 @@ export function App() {
           reason="設定の読み込みが終わると使えます。"
           onClick={() => chooseSize("large")}
         />
+        {session.unsaved ? (
+          <button
+            type="button"
+            disabled={pages.length === 0 || busy || loading}
+            title={pages.length === 0 ? "見えているページがないため書き出せません。" : undefined}
+            onClick={() => void exportAll()}
+          >
+            未保存
+          </button>
+        ) : null}
         <button
           type="button"
           className="export-button"
-          disabled={pages.length === 0 || busy}
+          disabled={pages.length === 0 || busy || loading}
           title={pages.length === 0 ? "見えているページがないため書き出せません。" : undefined}
           onClick={() => void exportAll()}
         >
@@ -815,8 +931,8 @@ export function App() {
             }
           }}
         >
-          {pdf && active ? (
-            <ZoomPreview pdf={pdf} pages={pages} activeId={active.id} zoom={zoom} onMetrics={onMetrics} />
+          {activePdf && active ? (
+            <ZoomPreview pdfs={pdfs} pages={pages} activeId={active.id} zoom={zoom} onMetrics={onMetrics} />
           ) : emptyMessage ? (
             <p className="empty">{emptyMessage}</p>
           ) : null}
@@ -830,9 +946,9 @@ export function App() {
           onPointerDown={onSplitterPointerDown}
         />
         <section className="thumb-pane" style={{ height: heights.thumbs }} ref={thumbsRef}>
-          {pdf && pages.length > 0 ? (
+          {pages.length > 0 ? (
             <ThumbnailStrip
-              pdf={pdf}
+              pdfs={pdfs}
               pages={pages}
               names={names}
               selectedIds={session.selected_page_ids}

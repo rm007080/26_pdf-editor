@@ -68,6 +68,11 @@ input {
   clip: rect(0 0 0 0);
 }
 
+.file-button:has(input:disabled) {
+  opacity: 0.45;
+  cursor: default;
+}
+
 .toolbar button,
 .result button,
 .jump button {
@@ -196,6 +201,7 @@ input {
 
 .notice {
   color: #8a2e16;
+  white-space: pre-line;
 }
 
 .thumbs {

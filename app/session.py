@@ -15,7 +15,7 @@ def default_app_temp_dir() -> Path:
 UNDO_LIMIT = 100
 EMPTY_UNDO_HINT = "元に戻せる操作がありません。実行しても状態は変わりません"
 EMPTY_REDO_HINT = "やり直せる操作がありません。実行しても状態は変わりません"
-CLIENT_COMMANDS = {"rotate", "delete", "reorder", "undo", "redo"}
+CLIENT_COMMANDS = {"rotate", "delete", "reorder", "append_documents", "undo", "redo"}
 
 
 class LoadError(Exception):
@@ -42,7 +42,10 @@ class Session:
         self._undo: list[dict[str, object]] = []
         self._redo: list[dict[str, object]] = []
         self._history_drop_notified = False
-        self.session_file: Path | None = None
+        self._intakes: dict[str, dict[str, object]] = {}
+        self._copies: dict[str, Path] = {}
+        self._catalog: dict[str, str] = {}
+        self._baseline: list[tuple[str, int, int]] = []
         self.pause_during_load = None
         self.before_commit = None
         self._assign_selection([], None)
@@ -58,7 +61,10 @@ class Session:
             self._undo = []
             self._redo = []
             self._history_drop_notified = False
-            self.session_file = None
+            self._intakes = {}
+            self._copies = {}
+            self._catalog = {}
+            self._baseline = []
             self._activity = Activity.IDLE
 
     def shutdown(self) -> None:
@@ -118,6 +124,11 @@ class Session:
                 return self._undo_unlocked()
             if kind == "redo":
                 return self._redo_unlocked()
+            if kind == "append_documents":
+                detail = self._append_error(body)
+                if detail is not None:
+                    return 400, {"detail": detail}
+                return self._apply_append_unlocked(body)
             detail = self._user_command_error(body)
             if detail is not None:
                 return 400, {"detail": detail}
@@ -128,11 +139,13 @@ class Session:
         self.active_page_id = active_page_id
 
     def _snapshot_unlocked(self) -> dict[str, object]:
+        workspace = self._workspace_ids()
         return {
             "documents": [dict(item) for item in self.documents],
-            "pages": [dict(item) for item in self.pages],
+            "pages": [dict(item) for item in self.pages if item["document_id"] in workspace],
             "selected_page_ids": self._sorted_ids(self.selected_page_ids),
             "active_page_id": self.active_page_id,
+            "unsaved": self._output_state() != self._baseline,
             **self._history_fields(),
         }
 
@@ -162,8 +175,22 @@ class Session:
         body["history_dropped"] = history_dropped
         return body
 
+    def _workspace_ids(self) -> set[str]:
+        return {document["id"] for document in self.documents}
+
+    def _output_state(self) -> list[tuple[str, int, int]]:
+        return [
+            (str(page["document_id"]), int(page["source_page"]), int(page["rotation"]))
+            for page in self._visible_pages_unlocked()
+        ]
+
     def _visible_pages_unlocked(self) -> list[dict[str, object]]:
-        pages = [page for page in self.pages if not page["deleted"]]
+        workspace = self._workspace_ids()
+        pages = [
+            page
+            for page in self.pages
+            if page["document_id"] in workspace and not page["deleted"]
+        ]
         pages.sort(key=lambda page: page["order"])
         return pages
 
@@ -244,6 +271,56 @@ class Session:
         if len(page_ids) == 1 and page_ids[0] not in selected:
             return None
         return "そのページの組み合わせは並べ替えられません"
+
+    def _append_error(self, body: dict) -> str | None:
+        document_ids = body.get("document_ids")
+        if (
+            not isinstance(document_ids, list)
+            or not document_ids
+            or any(not isinstance(document_id, str) for document_id in document_ids)
+        ):
+            return "追加する PDF の指定が不正です"
+        if len(document_ids) != len(set(document_ids)):
+            return "追加単位の識別子が重複しています"
+        workspace = self._workspace_ids()
+        for document_id in document_ids:
+            if document_id in workspace:
+                return "すでに作業領域にある PDF は追加できません"
+            if document_id not in self._intakes and document_id not in self._catalog:
+                return "受け取っていない PDF は追加できません"
+        return None
+
+    def _apply_append_unlocked(self, body: dict) -> tuple[int, dict]:
+        document_ids = list(body["document_ids"])
+        was_empty = len(self.documents) == 0
+        before_selected = list(self.selected_page_ids)
+        before_active = self.active_page_id
+        normalized = {"type": "append_documents", "document_ids": document_ids}
+        if not self._mutate(normalized):
+            return 200, self._command_response(False, False)
+        if was_empty:
+            visible = self._visible_ids()
+            if visible:
+                after_selected: list[str] = [visible[0]]
+                after_active: str | None = visible[0]
+            else:
+                after_selected = []
+                after_active = None
+        else:
+            after_selected = list(before_selected)
+            after_active = before_active
+        self._assign_selection(self._sorted_ids(after_selected), after_active)
+        self._redo = []
+        record = {
+            "inverse": {"type": "remove_documents", "document_ids": list(document_ids)},
+            "original": normalized,
+            "before_selected": before_selected,
+            "before_active": before_active,
+            "after_selected": list(self.selected_page_ids),
+            "after_active": self.active_page_id,
+        }
+        dropped = self._push_undo(record)
+        return 200, self._command_response(True, dropped)
 
     def _apply_user_unlocked(self, body: dict) -> tuple[int, dict]:
         ordered = self._visible_order(body["page_ids"])
@@ -384,6 +461,11 @@ class Session:
             return True
         if kind == "reorder":
             return self._reorder(command)
+        if kind == "append_documents":
+            return self._place_documents(list(command["document_ids"]))
+        if kind == "remove_documents":
+            self._detach_documents(list(command["document_ids"]))
+            return True
         self._reinsert(command["pages"])
         return True
 
@@ -420,37 +502,137 @@ class Session:
 
     def _apply_sequence(self, visible_ids: list[str]) -> None:
         wanted = set(visible_ids)
+        workspace = self._workspace_ids()
         by_id = {page["id"]: page for page in self.pages}
         for page in self.pages:
-            if page["id"] not in wanted:
-                page["deleted"] = True
-                page["order"] = 0
+            if page["document_id"] not in workspace or page["id"] in wanted:
+                continue
+            page["deleted"] = True
+            page["order"] = 0
         for index, page_id in enumerate(visible_ids, start=1):
             page = by_id[page_id]
             page["deleted"] = False
             page["order"] = index
 
-    def session_file_path(self) -> Path | None:
+    def _renumber(self, visible_ids: list[str]) -> None:
+        by_id = {page["id"]: page for page in self.pages}
+        for index, page_id in enumerate(visible_ids, start=1):
+            by_id[page_id]["order"] = index
+
+    def _place_documents(self, document_ids: list[str]) -> bool:
+        was_empty = len(self.documents) == 0
+        existing = self._visible_ids()
+        appended: list[str] = []
+        for document_id in document_ids:
+            if document_id in self._intakes:
+                intake = self._intakes.pop(document_id)
+                filename = str(intake["filename"])
+                self._catalog[document_id] = filename
+                self._append_new_pages(document_id, int(intake["page_count"]))
+                self.documents.append({"id": document_id, "filename": filename})
+            else:
+                filename = self._catalog[document_id]
+                self.documents.append({"id": document_id, "filename": filename})
+            own = [page for page in self.pages if page["document_id"] == document_id and not page["deleted"]]
+            own.sort(key=lambda page: (int(page["order"]), int(page["source_page"])))
+            appended.extend(str(page["id"]) for page in own)
+        self._renumber(existing + appended)
+        if was_empty and len(document_ids) == 1:
+            self._baseline = self._output_state()
+        return True
+
+    def _detach_documents(self, document_ids: list[str]) -> None:
+        removing = set(document_ids)
+        self.documents = [document for document in self.documents if document["id"] not in removing]
+        self._renumber(self._visible_ids())
+
+    def _append_new_pages(self, document_id: str, page_count: int) -> None:
+        for number in range(1, page_count + 1):
+            self.pages.append(
+                {
+                    "id": uuid4().hex,
+                    "document_id": document_id,
+                    "source_page": number,
+                    "order": number,
+                    "deleted": False,
+                    "rotation": 0,
+                }
+            )
+
+    def workspace_copy_path(self, document_id: str) -> Path | None:
         with self._lock:
-            path = self.session_file
+            if document_id not in self._workspace_ids():
+                return None
+            path = self._copies.get(document_id)
         if path is not None and path.is_file():
             return path
         return None
 
+    def export_plan(self) -> dict[str, object] | None:
+        with self._lock:
+            pages = self._visible_pages_unlocked()
+            if not pages:
+                return None
+            visible_docs = {str(page["document_id"]) for page in pages}
+            filename = next(
+                (document["filename"] for document in self.documents if document["id"] in visible_docs),
+                None,
+            )
+            if filename is None:
+                return None
+            page_plan = [
+                (str(page["document_id"]), int(page["source_page"]), int(page["rotation"]))
+                for page in pages
+            ]
+            paths: dict[str, Path] = {}
+            required = 0
+            for document_id, _source_page, _rotation in page_plan:
+                if document_id in paths:
+                    continue
+                path = self._copies[document_id]
+                paths[document_id] = path
+                required += path.stat().st_size
+            return {"filename": filename, "pages": page_plan, "bytes": required, "paths": paths}
+
+    def mark_saved(self, pages: list[tuple[str, int, int]]) -> None:
+        with self._lock:
+            self._baseline = list(pages)
+
+    def discard(self, body: object) -> tuple[int, dict]:
+        if not isinstance(body, dict):
+            return 400, {"detail": "破棄する PDF の指定が不正です"}
+        document_ids = body.get("document_ids")
+        if not isinstance(document_ids, list) or any(not isinstance(document_id, str) for document_id in document_ids):
+            return 400, {"detail": "破棄する PDF の指定が不正です"}
+        with self._lock:
+            if len(document_ids) != len(set(document_ids)):
+                return 400, {"detail": "追加単位の識別子が重複しています"}
+            if not document_ids:
+                return 200, {"discarded": []}
+            for document_id in document_ids:
+                if document_id not in self._intakes:
+                    return 400, {"detail": "作業領域へ入れていない受け取りだけを破棄できます"}
+            paths = [self._copies.pop(document_id) for document_id in document_ids]
+            for document_id in document_ids:
+                del self._intakes[document_id]
+        for path in paths:
+            path.unlink(missing_ok=True)
+        return 200, {"discarded": list(document_ids)}
+
     def accept_upload(self, data: bytes, filename: str) -> tuple[int, dict]:
         if not self.try_begin(Activity.LOADING):
-            return 409, {"detail": "読み込み中、または書き出し中のため受け付けられません"}
+            return 409, {"detail": "読み込み中、ダイアログ中、または書き出し中のため受け付けられません"}
         staging: Path | None = None
         try:
             if self.pause_during_load is not None:
                 self.pause_during_load()
             staging, page_count = self._stage(data, filename)
-            document, pages = self._records(Path(filename).name, page_count)
-            if not self._commit(document, pages, staging):
+            document_id = self._store_intake(Path(filename).name, page_count, staging)
+            if document_id is None:
                 staging.unlink(missing_ok=True)
                 return 409, {"detail": "書き出し中のため、読み込みを確定できませんでした"}
             staging = None
-            return 200, self.snapshot()
+            return 200, {"document_id": document_id}
         except LoadError as exc:
             if staging is not None:
                 staging.unlink(missing_ok=True)
@@ -458,29 +640,16 @@ class Session:
         finally:
             self.finish(Activity.LOADING)
 
-    def _commit(self, document: dict[str, str], pages: list[dict[str, object]], staging: Path) -> bool:
+    def _store_intake(self, filename: str, page_count: int, staging: Path) -> str | None:
         if self.before_commit is not None:
             self.before_commit()
         with self._lock:
             if self._activity is not Activity.LOADING:
-                return False
-            previous = self.session_file
-            self.documents = [document]
-            self.pages = pages
-            visible = [page for page in pages if not page["deleted"]]
-            visible.sort(key=lambda page: page["order"])
-            if visible:
-                self._assign_selection([str(visible[0]["id"])], str(visible[0]["id"]))
-            else:
-                self._assign_selection([], None)
-            self._undo = []
-            self._redo = []
-            self._history_drop_notified = False
-            self.session_file = staging
-            self._activity = Activity.IDLE
-        if previous is not None and previous != staging and previous.exists():
-            previous.unlink()
-        return True
+                return None
+            document_id = uuid4().hex
+            self._intakes[document_id] = {"filename": filename, "page_count": page_count}
+            self._copies[document_id] = staging
+            return document_id
 
     def _stage(self, data: bytes, filename: str) -> tuple[Path, int]:
         safe_name = Path(filename).name
@@ -501,23 +670,6 @@ class Session:
             staging.unlink(missing_ok=True)
             raise
 
-    def _records(self, filename: str, page_count: int) -> tuple[dict[str, str], list[dict[str, object]]]:
-        document_id = uuid4().hex
-        document = {"id": document_id, "filename": filename}
-        pages = [
-            {
-                "id": uuid4().hex,
-                "document_id": document_id,
-                "source_page": number,
-                "order": number,
-                "deleted": False,
-                "rotation": 0,
-            }
-            for number in range(1, page_count + 1)
-        ]
-        return document, pages
-
-
 def _operation_phrase(command: object) -> str:
     if not isinstance(command, dict):
         return "操作する"
@@ -533,4 +685,8 @@ def _operation_phrase(command: object) -> str:
         return "ページを並べ替える"
     if kind == "restore_order":
         return "並べ替えを元に戻す"
+    if kind == "append_documents":
+        return "PDFを追加する"
+    if kind == "remove_documents":
+        return "追加したPDFを外す"
     return "操作する"

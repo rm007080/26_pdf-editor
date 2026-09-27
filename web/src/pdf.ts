@@ -3,9 +3,9 @@ import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 
 GlobalWorkerOptions.workerSrc = workerUrl;
 
-export function openSessionPdf(token: string): Promise<PDFDocumentProxy> {
+export function openDocumentPdf(token: string, documentId: string): Promise<PDFDocumentProxy> {
   return getDocument({
-    url: "/api/session/file",
+    url: `/api/session/files/${documentId}`,
     httpHeaders: { Authorization: `Bearer ${token}` },
     disableStream: true,
     disableAutoFetch: true,

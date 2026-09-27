@@ -19,13 +19,13 @@ function neighborPages(pages: PageRecord[], activeId: string): PageRecord[] {
 }
 
 export function ZoomPreview({
-  pdf,
+  pdfs,
   pages,
   activeId,
   zoom,
   onMetrics,
 }: {
-  pdf: PDFDocumentProxy;
+  pdfs: Map<string, PDFDocumentProxy>;
   pages: PageRecord[];
   activeId: string;
   zoom: ZoomState;
@@ -36,14 +36,15 @@ export function ZoomPreview({
   const cacheRef = useRef<Map<string, { scale: number; rotation: number; canvas: HTMLCanvasElement }>>(new Map());
   const ratios = useRef({ x: 0, y: 0 });
   const restoring = useRef(false);
-  const pdfRef = useRef(pdf);
+  const active = pages.find((page) => page.id === activeId) ?? null;
+  const activePdf = active ? (pdfs.get(active.document_id) ?? null) : null;
+  const pdfRef = useRef<PDFDocumentProxy | null>(activePdf);
   const [view, setView] = useState({ width: 0, height: 0 });
   const [base, setBase] = useState<{ width: number; height: number } | null>(null);
   const [tick, setTick] = useState(0);
-  const active = pages.find((page) => page.id === activeId) ?? null;
 
-  if (pdfRef.current !== pdf) {
-    pdfRef.current = pdf;
+  if (pdfRef.current !== activePdf) {
+    pdfRef.current = activePdf;
     cacheRef.current.clear();
   }
 
@@ -60,14 +61,14 @@ export function ZoomPreview({
   }, []);
 
   useEffect(() => {
-    if (!active) {
+    if (!active || !activePdf) {
       return;
     }
     const sourcePage = active.source_page;
     let cancelled = false;
     setBase(null);
     const additional = active.rotation;
-    void pdf.getPage(sourcePage).then((page) => {
+    void activePdf.getPage(sourcePage).then((page) => {
       const viewport = page.getViewport({ scale: 1, rotation: (page.rotate + additional) % 360 });
       if (!cancelled) {
         setBase({ width: viewport.width, height: viewport.height });
@@ -76,7 +77,7 @@ export function ZoomPreview({
     return () => {
       cancelled = true;
     };
-  }, [pdf, activeId, active?.source_page, active?.rotation]);
+  }, [activePdf, activeId, active?.source_page, active?.rotation]);
 
   const measured = Boolean(base) && view.width > 1 && view.height > 1;
   const fitPage = measured && base ? Math.min(view.width / base.width, view.height / base.height) * 100 : 0;
@@ -122,7 +123,11 @@ export function ZoomPreview({
         if (cancelled || cache.has(page.id)) {
           continue;
         }
-        const started = await startPageBitmap(pdf, page.source_page, scale, page.rotation);
+        const pagePdf = pdfs.get(page.document_id);
+        if (!pagePdf) {
+          continue;
+        }
+        const started = await startPageBitmap(pagePdf, page.source_page, scale, page.rotation);
         tasks.push(started.task);
         if (cancelled) {
           started.task.cancel();
@@ -156,7 +161,7 @@ export function ZoomPreview({
         task.cancel();
       }
     };
-  }, [pdf, activeId, effective, neighborKey, measured]);
+  }, [pdfs, activeId, effective, neighborKey, measured]);
 
   useLayoutEffect(() => {
     const slot = slotRef.current;
@@ -272,7 +277,7 @@ type ThumbDrag = {
 };
 
 export function ThumbnailStrip({
-  pdf,
+  pdfs,
   pages,
   names,
   selectedIds,
@@ -287,7 +292,7 @@ export function ThumbnailStrip({
   onBlank,
   onColumns,
 }: {
-  pdf: PDFDocumentProxy;
+  pdfs: Map<string, PDFDocumentProxy>;
   pages: PageRecord[];
   names: Map<string, string>;
   selectedIds: string[];
@@ -483,7 +488,7 @@ export function ThumbnailStrip({
         <Fragment key={page.id}>
           {dragSlot === index ? <span className="drop-line" /> : null}
           <Thumbnail
-            pdf={pdf}
+            pdf={pdfs.get(page.document_id) ?? null}
             page={page}
             filename={names.get(page.document_id) ?? ""}
             selected={selectedIds.includes(page.id)}
@@ -527,7 +532,7 @@ function Thumbnail({
   onPointerUp,
   consumeSuppressedClick,
 }: {
-  pdf: PDFDocumentProxy;
+  pdf: PDFDocumentProxy | null;
   page: PageRecord;
   filename: string;
   selected: boolean;
@@ -547,6 +552,9 @@ function Thumbnail({
   const [ratio, setRatio] = useState(0.75);
 
   useEffect(() => {
+    if (!pdf) {
+      return;
+    }
     let cancelled = false;
     void pdf.getPage(page.source_page).then((pdfPage) => {
       const viewport = pdfPage.getViewport({
@@ -607,7 +615,7 @@ function Thumbnail({
         }}
       >
         <span className="thumb-frame" style={{ width, height: frameHeight }}>
-          {shown ? (
+          {shown && pdf ? (
             <ThumbnailCanvas
               pdf={pdf}
               sourcePage={page.source_page}

@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from app.main import create_app
 from app.save_dialog import documents_folder
 from app.session import Session
+from tests.test_session import load_pdf
 
 STAGES = {"copying", "verifying", "committing", "completed", "failed"}
 
@@ -65,7 +66,7 @@ def test_export_matches_page_count_and_keeps_original(env, tmp_path):
     source = tmp_path / "sample.pdf"
     write_pdf(source, pages=2)
     original = source.read_bytes()
-    assert post_file(client, app, source).status_code == 200
+    load_pdf(client, app, source)
     before_copy = next(session.temp_dir.iterdir()).read_bytes()
     destination = tmp_path / "out"
     destination.mkdir()
@@ -98,7 +99,7 @@ def test_existing_name_is_not_overwritten(env, tmp_path):
     client, app, _session = env
     source = tmp_path / "sample.pdf"
     write_pdf(source, pages=1)
-    assert post_file(client, app, source).status_code == 200
+    load_pdf(client, app, source)
     destination = tmp_path / "out"
     destination.mkdir()
     existing = destination / "sample_編集済み.pdf"
@@ -118,7 +119,7 @@ def test_cancel_leaves_no_file_and_allows_another_export(env, tmp_path):
     client, app, session = env
     source = tmp_path / "sample.pdf"
     write_pdf(source, pages=1)
-    assert post_file(client, app, source).status_code == 200
+    load_pdf(client, app, source)
     copies = {path.name for path in session.temp_dir.iterdir()}
     app.state.exporter.ask_save_path = lambda _directory, _name: None
 
@@ -138,7 +139,7 @@ def test_failed_verification_removes_temp_file(env, tmp_path):
     client, app, _session = env
     source = tmp_path / "sample.pdf"
     write_pdf(source, pages=1)
-    assert post_file(client, app, source).status_code == 200
+    load_pdf(client, app, source)
     destination = tmp_path / "out"
     destination.mkdir()
     app.state.exporter.ask_save_path = lambda _directory, _name: destination / "out.pdf"
@@ -155,7 +156,7 @@ def test_insufficient_space_creates_no_file(env, tmp_path):
     client, app, _session = env
     source = tmp_path / "sample.pdf"
     write_pdf(source, pages=1)
-    assert post_file(client, app, source).status_code == 200
+    load_pdf(client, app, source)
     destination = tmp_path / "out"
     destination.mkdir()
     app.state.exporter.ask_save_path = lambda _directory, _name: destination / "out.pdf"
@@ -172,7 +173,7 @@ def test_requests_stay_responsive_while_dialog_is_open(env, tmp_path):
     client, app, _session = env
     source = tmp_path / "sample.pdf"
     write_pdf(source, pages=1)
-    assert post_file(client, app, source).status_code == 200
+    loaded = load_pdf(client, app, source)
     stored = source.read_bytes()
     started = threading.Event()
     release = threading.Event()
@@ -193,7 +194,7 @@ def test_requests_stay_responsive_while_dialog_is_open(env, tmp_path):
     assert started.wait(5)
     session_response = client.get("/api/session", headers=auth(app))
     file_response = client.get(
-        "/api/session/file",
+        f"/api/session/files/{loaded['documents'][0]['id']}",
         headers={**auth(app), "Range": "bytes=0-3"},
     )
     document_conflict = post_file(client, app, source)
@@ -218,7 +219,7 @@ def test_export_in_progress_rejects_load_and_another_export(env, tmp_path):
     other = tmp_path / "other.pdf"
     write_pdf(source, pages=1)
     write_pdf(other, pages=1)
-    assert post_file(client, app, source).status_code == 200
+    loaded = load_pdf(client, app, source)
     kept = client.get("/api/session", headers=auth(app)).json()
     stored = next(session.temp_dir.iterdir()).read_bytes()
     destination = tmp_path / "out"
@@ -238,7 +239,7 @@ def test_export_in_progress_rejects_load_and_another_export(env, tmp_path):
     assert started.wait(5)
     during = client.get(f"/api/exports/{job_id}", headers=auth(app))
     file_response = client.get(
-        "/api/session/file",
+        f"/api/session/files/{loaded['documents'][0]['id']}",
         headers={**auth(app), "Range": "bytes=0-3"},
     )
     assert post_file(client, app, other).status_code == 409
@@ -259,7 +260,7 @@ def test_export_is_rejected_while_loading(env, tmp_path):
     client, app, session = env
     source = tmp_path / "sample.pdf"
     write_pdf(source, pages=1)
-    assert post_file(client, app, source).status_code == 200
+    load_pdf(client, app, source)
     incoming = tmp_path / "incoming.pdf"
     write_pdf(incoming, pages=1)
     started = threading.Event()
@@ -292,7 +293,7 @@ def test_inflight_load_does_not_replace_session_during_export(env, tmp_path):
     incoming = tmp_path / "incoming.pdf"
     write_pdf(source, pages=2)
     write_pdf(incoming, pages=1)
-    assert post_file(client, app, source).status_code == 200
+    load_pdf(client, app, source)
     kept = client.get("/api/session", headers=auth(app)).json()
     copies = {path.name: path.read_bytes() for path in session.temp_dir.iterdir()}
 
@@ -316,7 +317,7 @@ def test_export_adds_session_rotation_without_changing_source(env, tmp_path):
     pdf.add_blank_page(page_size=(72, 72))
     pdf.save(source)
     original = source.read_bytes()
-    loaded = post_file(client, app, source).json()
+    loaded = load_pdf(client, app, source)
     ids = [page["id"] for page in loaded["pages"]]
     command = client.post(
         "/api/session/commands",
@@ -343,7 +344,7 @@ def test_export_rejected_when_no_visible_pages(env, tmp_path):
     client, app, _session = env
     source = tmp_path / "sample.pdf"
     write_pdf(source, pages=1)
-    loaded = post_file(client, app, source).json()
+    loaded = load_pdf(client, app, source)
     deleted = client.post(
         "/api/session/commands",
         headers=auth(app),
@@ -360,7 +361,7 @@ def test_open_actions_work_only_after_success(env, tmp_path):
     client, app, _session = env
     source = tmp_path / "sample.pdf"
     write_pdf(source, pages=1)
-    assert post_file(client, app, source).status_code == 200
+    load_pdf(client, app, source)
     destination = tmp_path / "out"
     destination.mkdir()
     started = threading.Event()
@@ -388,3 +389,95 @@ def test_open_actions_work_only_after_success(env, tmp_path):
     assert client.post(f"/api/exports/{job_id}/open-folder", headers=auth(app)).status_code == 200
     assert opened == [Path(job["path"])]
     assert folders == [Path(job["path"])]
+
+
+def write_sized(path: Path, sizes: list[tuple[int, int]]) -> None:
+    pdf = pikepdf.Pdf.new()
+    for width, height in sizes:
+        pdf.add_blank_page(page_size=(width, height))
+    pdf.save(path)
+
+
+def test_export_copies_pages_from_each_document_in_order(env, tmp_path):
+    client, app, _session = env
+    first = tmp_path / "first.pdf"
+    second = tmp_path / "second.pdf"
+    write_sized(first, [(72, 100), (72, 120)])
+    write_sized(second, [(72, 200)])
+    load_pdf(client, app, first)
+    load_pdf(client, app, second)
+    destination = tmp_path / "out"
+    destination.mkdir()
+    seen: dict[str, str] = {}
+
+    def dialog(_directory: Path, name: str) -> Path:
+        seen["name"] = name
+        return destination / "out.pdf"
+
+    app.state.exporter.ask_save_path = dialog
+    response = post_export(client, app)
+    job = wait_job(client, app, response.json()["job_id"])
+
+    assert seen["name"] == "first_編集済み.pdf"
+    assert job["stage"] == "completed"
+    assert "unsaved" not in job
+    with pikepdf.open(job["path"]) as pdf:
+        assert [float(page.mediabox[3]) for page in pdf.pages] == [100, 120, 200]
+    session = client.get("/api/session", headers=auth(app)).json()
+    assert session["unsaved"] is False
+    assert session["undo_enabled"] is True
+
+
+def test_export_filename_skips_document_without_visible_pages(env, tmp_path):
+    client, app, _session = env
+    first = tmp_path / "first.pdf"
+    second = tmp_path / "second.pdf"
+    write_sized(first, [(72, 80)])
+    write_sized(second, [(72, 90)])
+    loaded = load_pdf(client, app, first)
+    deleted = client.post(
+        "/api/session/commands",
+        headers=auth(app),
+        json={"type": "delete", "page_ids": [loaded["pages"][0]["id"]]},
+    )
+    assert deleted.status_code == 200
+    load_pdf(client, app, second)
+    destination = tmp_path / "out"
+    destination.mkdir()
+    seen: dict[str, str] = {}
+    app.state.exporter.ask_save_path = lambda _directory, name: seen.setdefault("name", name) and destination / "out.pdf"
+    response = post_export(client, app)
+    job = wait_job(client, app, response.json()["job_id"])
+
+    assert seen["name"] == "second_編集済み.pdf"
+    with pikepdf.open(job["path"]) as pdf:
+        assert len(pdf.pages) == 1
+        assert float(pdf.pages[0].mediabox[3]) == 90
+
+
+def test_failed_and_cancelled_export_keep_unsaved(env, tmp_path):
+    client, app, _session = env
+    source = tmp_path / "sample.pdf"
+    write_pdf(source, pages=1)
+    loaded = load_pdf(client, app, source)
+    rotated = client.post(
+        "/api/session/commands",
+        headers=auth(app),
+        json={"type": "rotate", "page_ids": [loaded["pages"][0]["id"]], "direction": "right"},
+    )
+    assert rotated.json()["unsaved"] is True
+    app.state.exporter.ask_save_path = lambda _directory, _name: None
+    cancelled = post_export(client, app)
+    assert cancelled.json() == {"status": "cancelled"}
+    assert client.get("/api/session", headers=auth(app)).json()["unsaved"] is True
+
+    destination = tmp_path / "out"
+    destination.mkdir()
+    app.state.exporter.ask_save_path = lambda _directory, _name: destination / "out.pdf"
+    app.state.exporter.page_count = lambda _path: 0
+    failed = post_export(client, app)
+    job = wait_job(client, app, failed.json()["job_id"])
+    assert job["stage"] == "failed"
+    assert "unsaved" not in job
+    assert client.get("/api/session", headers=auth(app)).json()["unsaved"] is True
+    assert client.get("/api/session", headers=auth(app)).json()["undo_enabled"] is True

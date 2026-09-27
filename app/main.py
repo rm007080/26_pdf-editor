@@ -120,9 +120,17 @@ def create_app(session: Session | None = None, settings_path: Path | None = None
         status, body = await asyncio.to_thread(session.accept_upload, data, filename)
         return JSONResponse(status_code=status, content=body)
 
-    @app.get("/api/session/file")
-    def get_session_file():
-        path = session.session_file_path()
+    @app.post("/api/documents/discard")
+    async def post_discard(request: Request) -> JSONResponse:
+        body, error = await read_json_body(request, "破棄する PDF の指定が不正です")
+        if error is not None:
+            return error
+        status, payload = session.discard(body)
+        return JSONResponse(status_code=status, content=payload)
+
+    @app.get("/api/session/files/{document_id}")
+    def get_document_file(document_id: str):
+        path = session.workspace_copy_path(document_id)
         if path is None:
             return JSONResponse(status_code=404, content={"detail": "読み込まれた PDF はありません"})
         return FileResponse(path, media_type="application/pdf")

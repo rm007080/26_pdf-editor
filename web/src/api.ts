@@ -68,12 +68,20 @@ export function getSession(token: string): Promise<SessionState> {
   return request(token, "/api/session").then((response) => readJson<SessionState>(response));
 }
 
-export function postDocument(token: string, file: File): Promise<SessionState> {
+export function postDocument(token: string, file: File): Promise<{ document_id: string }> {
   const body = new FormData();
   body.append("file", file);
   return request(token, "/api/documents", { method: "POST", body }).then((response) =>
-    readJson<SessionState>(response),
+    readJson<{ document_id: string }>(response),
   );
+}
+
+export function discardDocuments(token: string, documentIds: string[]): Promise<{ discarded: string[] }> {
+  return request(token, "/api/documents/discard", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ document_ids: documentIds }),
+  }).then((response) => readJson<{ discarded: string[] }>(response));
 }
 
 export function postExport(token: string): Promise<ExportStart> {
