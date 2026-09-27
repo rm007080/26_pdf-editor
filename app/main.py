@@ -120,6 +120,14 @@ def create_app(session: Session | None = None, settings_path: Path | None = None
         status, body = await asyncio.to_thread(session.accept_upload, data, filename)
         return JSONResponse(status_code=status, content=body)
 
+    @app.post("/api/documents/{document_id}/password")
+    async def post_document_password(document_id: str, request: Request) -> JSONResponse:
+        body, error = await read_json_body(request, "パスワードの指定が不正です")
+        if error is not None:
+            return error
+        status, payload = await asyncio.to_thread(session.submit_password, document_id, body)
+        return JSONResponse(status_code=status, content=payload)
+
     @app.post("/api/documents/discard")
     async def post_discard(request: Request) -> JSONResponse:
         body, error = await read_json_body(request, "破棄する PDF の指定が不正です")

@@ -19,10 +19,62 @@ def write_pdf(path: Path, pages: int) -> None:
     pdf.save(path)
 
 
-def write_encrypted_pdf(path: Path) -> None:
+def write_encrypted_pdf(path: Path, *, password: str = "secret", signed: bool = False) -> None:
     pdf = pikepdf.Pdf.new()
     pdf.add_blank_page(page_size=(72, 72))
-    pdf.save(path, encryption=pikepdf.Encryption(user="secret", owner="owner-secret"))
+    if signed:
+        pdf.Root.Perms = pikepdf.Dictionary(DocMDP=pikepdf.Dictionary())
+    pdf.save(path, encryption=pikepdf.Encryption(user=password, owner="owner-secret"))
+
+
+def write_restricted_pdf(path: Path) -> None:
+    pdf = pikepdf.Pdf.new()
+    pdf.add_blank_page(page_size=(72, 72))
+    pdf.save(
+        path,
+        encryption=pikepdf.Encryption(
+            owner="owner-secret",
+            user="",
+            allow=pikepdf.Permissions(extract=False, modify_other=False),
+        ),
+    )
+
+
+def write_docmdp_pdf(path: Path) -> None:
+    pdf = pikepdf.Pdf.new()
+    pdf.add_blank_page(page_size=(72, 72))
+    pdf.Root.Perms = pikepdf.Dictionary(DocMDP=pikepdf.Dictionary())
+    pdf.save(path)
+
+
+def write_sigflags_pdf(path: Path) -> None:
+    pdf = pikepdf.Pdf.new()
+    pdf.add_blank_page(page_size=(72, 72))
+    pdf.Root.AcroForm = pikepdf.Dictionary(SigFlags=3, Fields=pikepdf.Array())
+    pdf.save(path)
+
+
+def write_sig_field_pdf(path: Path) -> None:
+    pdf = pikepdf.Pdf.new()
+    pdf.add_blank_page(page_size=(72, 72))
+    field = pikepdf.Dictionary(FT=pikepdf.Name.Sig, T="Sign")
+    parent = pikepdf.Dictionary(Kids=pikepdf.Array([field]))
+    pdf.Root.AcroForm = pikepdf.Dictionary(Fields=pikepdf.Array([parent]))
+    pdf.save(path)
+
+
+def write_padded_pdf(path: Path, size: int) -> None:
+    pdf = pikepdf.Pdf.new()
+    pdf.add_blank_page(page_size=(72, 72))
+    pdf.save(path)
+    raw = path.read_bytes()
+    if len(raw) > size:
+        raise RuntimeError("作成した PDF が指定サイズを超えています")
+    path.write_bytes(raw + b" " * (size - len(raw)))
+
+
+def stored_copies(session: Session) -> dict[str, bytes]:
+    return {path.name: path.read_bytes() for path in session.temp_dir.iterdir()}
 
 
 @pytest.fixture
@@ -37,11 +89,23 @@ def auth(app) -> dict[str, str]:
     return {"Authorization": f"Bearer {app.state.token}"}
 
 
+INTAKE_KEYS = {"document_id", "needs_password", "byte_size", "page_count", "signed", "duplicate"}
+BYTE_LIMIT = 100 * 1024 * 1024
+
+
 def post_file(client: TestClient, app, path: Path, content_type: str = "application/pdf"):
     return client.post(
         "/api/documents",
         headers=auth(app),
         files={"file": (path.name, path.read_bytes(), content_type)},
+    )
+
+
+def post_password(client: TestClient, app, document_id: str, password: str):
+    return client.post(
+        f"/api/documents/{document_id}/password",
+        headers=auth(app),
+        json={"password": password},
     )
 
 
@@ -93,7 +157,8 @@ def test_load_records_pages_and_leaves_original_unchanged(env, tmp_path):
     received = post_file(client, app, source)
 
     assert received.status_code == 200
-    assert set(received.json()) == {"document_id"}
+    assert set(received.json()) == INTAKE_KEYS
+    assert received.json()["needs_password"] is False
     assert client.get("/api/session", headers=auth(app)).json() == before
     appended = client.post(
         "/api/session/commands",
@@ -136,16 +201,26 @@ def test_unreadable_pdf_is_not_kept(env, tmp_path):
     assert list(session.temp_dir.iterdir()) == []
 
 
-def test_password_pdf_is_not_kept(env, tmp_path):
+def test_password_pdf_returns_id_without_changing_session(env, tmp_path):
     client, app, session = env
     source = tmp_path / "secret.pdf"
     write_encrypted_pdf(source)
+    before = client.get("/api/session", headers=auth(app)).json()
 
     response = post_file(client, app, source)
 
-    assert response.status_code == 400
-    assert "パスワード" in response.json()["detail"]
-    assert list(session.temp_dir.iterdir()) == []
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body) == INTAKE_KEYS
+    assert body["needs_password"] is True
+    assert body["page_count"] is None
+    assert body["signed"] is False
+    assert body["byte_size"] == source.stat().st_size
+    assert body["duplicate"] is False
+    assert client.get("/api/session", headers=auth(app)).json() == before
+    assert len(list(session.temp_dir.iterdir())) == 1
+    hidden = client.get(f"/api/session/files/{body['document_id']}", headers=auth(app))
+    assert hidden.status_code == 404
 
 
 def test_second_success_appends_and_keeps_previous_copy(env, tmp_path):
@@ -235,7 +310,7 @@ def test_overlapping_load_is_rejected_without_damage(env, tmp_path):
     assert worker.is_alive() is False
     response = result["response"]
     assert response.status_code == 200
-    assert set(response.json()) == {"document_id"}
+    assert set(response.json()) == INTAKE_KEYS
     assert client.get("/api/session", headers=auth(app)).json() == kept
 
 
@@ -861,7 +936,7 @@ def test_history_drop_is_notified_once_until_replace(env, tmp_path):
     assert post_command(client, app, {"type": "undo"}).status_code == 400
 
     replacement = tmp_path / "other.pdf"
-    write_pdf(replacement, pages=1)
+    write_pdf(replacement, pages=2)
     added = load_pdf(client, app, replacement)
     assert added["history_dropped"] is False
     assert added["undo_enabled"] is True
@@ -1071,7 +1146,7 @@ def test_discard_removes_only_fresh_intakes(env, tmp_path):
     source = tmp_path / "sample.pdf"
     other = tmp_path / "other.pdf"
     write_pdf(source, pages=1)
-    write_pdf(other, pages=1)
+    write_pdf(other, pages=2)
     fresh = post_file(client, app, source)
     assert fresh.status_code == 200
     fresh_id = fresh.json()["document_id"]
@@ -1135,3 +1210,322 @@ def test_document_file_is_workspace_only(env, tmp_path):
     assert gone.status_code == 404
     old = client.get("/api/session/file", headers=auth(app))
     assert old.status_code == 404
+
+
+def test_correct_password_strips_encryption_without_keeping_password(env, tmp_path):
+    client, app, session = env
+    source = tmp_path / "secret.pdf"
+    write_encrypted_pdf(source)
+    original = source.read_bytes()
+    received = post_file(client, app, source)
+    document_id = received.json()["document_id"]
+
+    wrong = post_password(client, app, document_id, "secret ")
+    kept = stored_copies(session)
+    assert wrong.status_code == 400
+    assert wrong.json()["detail"] == "パスワードが違います"
+    assert "secret" not in wrong.text
+    assert stored_copies(session) == kept
+
+    opened = post_password(client, app, document_id, "secret")
+
+    assert opened.status_code == 200
+    body = opened.json()
+    assert body["needs_password"] is False
+    assert body["page_count"] == 1
+    assert body["byte_size"] == len(original)
+    assert "secret" not in opened.text
+    copies = list(session.temp_dir.iterdir())
+    assert len(copies) == 1
+    assert "secret" not in copies[0].name
+    assert b"secret" not in copies[0].read_bytes()
+    with pikepdf.open(copies[0]) as pdf:
+        assert pdf.is_encrypted is False
+        assert len(pdf.pages) == 1
+    assert source.read_bytes() == original
+
+
+def test_unfinished_password_is_refused_without_deleting_copy(env, tmp_path):
+    client, app, session = env
+    source = tmp_path / "secret.pdf"
+    write_encrypted_pdf(source)
+    received = post_file(client, app, source)
+    document_id = received.json()["document_id"]
+    before = client.get("/api/session", headers=auth(app)).json()
+    copies = stored_copies(session)
+
+    refused = post_command(client, app, {"type": "append_documents", "document_ids": [document_id]})
+
+    assert refused.status_code == 400
+    assert client.get("/api/session", headers=auth(app)).json() == before
+    assert stored_copies(session) == copies
+    opened = post_password(client, app, document_id, "secret")
+    assert opened.status_code == 200
+
+
+def test_password_endpoint_rejects_unknown_workspace_and_plain(env, tmp_path):
+    client, app, session = env
+    source = tmp_path / "plain.pdf"
+    write_pdf(source, pages=1)
+    loaded = load_pdf(client, app, source)
+    document_id = loaded["documents"][0]["id"]
+    before = client.get("/api/session", headers=auth(app)).json()
+    copies = stored_copies(session)
+    fresh = post_file(client, app, source)
+    fresh_id = fresh.json()["document_id"]
+    fresh_copies = stored_copies(session)
+
+    unknown = post_password(client, app, "missing", "secret")
+    workspace = post_password(client, app, document_id, "secret")
+    plain = post_password(client, app, fresh_id, "secret")
+
+    assert unknown.status_code == 400
+    assert workspace.status_code == 400
+    assert plain.status_code == 400
+    assert client.get("/api/session", headers=auth(app)).json() == before
+    assert stored_copies(session) == fresh_copies
+    assert copies.keys() <= fresh_copies.keys()
+
+
+def test_password_is_refused_during_dialog_and_export(env, tmp_path):
+    client, app, session = env
+    source = tmp_path / "secret.pdf"
+    write_encrypted_pdf(source)
+    document_id = post_file(client, app, source).json()["document_id"]
+    before = client.get("/api/session", headers=auth(app)).json()
+    copies = stored_copies(session)
+
+    session.mark_dialog_before_commit_for_test()
+    during_dialog = post_password(client, app, document_id, "secret")
+    assert during_dialog.status_code == 409
+    session.finish(Activity.DIALOG)
+
+    session._activity = Activity.EXPORTING
+    during_export = post_password(client, app, document_id, "secret")
+    assert during_export.status_code == 409
+    session.finish(Activity.EXPORTING)
+
+    assert client.get("/api/session", headers=auth(app)).json() == before
+    assert stored_copies(session) == copies
+    assert post_password(client, app, document_id, "secret").status_code == 200
+
+
+def test_signature_dictionaries_are_marked_signed(env, tmp_path):
+    client, app, _session = env
+    samples = {
+        "docmdp.pdf": write_docmdp_pdf,
+        "flags.pdf": write_sigflags_pdf,
+        "field.pdf": write_sig_field_pdf,
+    }
+    for name, write in samples.items():
+        path = tmp_path / name
+        write(path)
+        body = post_file(client, app, path).json()
+        assert body["signed"] is True
+        assert body["needs_password"] is False
+
+
+def test_restrictions_without_signature_are_not_signed(env, tmp_path):
+    client, app, _session = env
+    source = tmp_path / "restricted.pdf"
+    write_restricted_pdf(source)
+
+    body = post_file(client, app, source).json()
+
+    assert body["needs_password"] is False
+    assert body["signed"] is False
+    assert body["page_count"] == 1
+
+
+def test_signed_password_pdf_reports_signature_after_unlock(env, tmp_path):
+    client, app, _session = env
+    source = tmp_path / "signed-secret.pdf"
+    write_encrypted_pdf(source, signed=True)
+    received = post_file(client, app, source).json()
+
+    assert received["needs_password"] is True
+    assert received["signed"] is False
+    assert received["page_count"] is None
+
+    opened = post_password(client, app, received["document_id"], "secret")
+
+    assert opened.status_code == 200
+    body = opened.json()
+    assert body["needs_password"] is False
+    assert body["signed"] is True
+    assert body["page_count"] == 1
+    assert body["byte_size"] == received["byte_size"]
+
+
+def test_page_count_boundary_for_large_pdf(env, tmp_path):
+    client, app, _session = env
+    exact = tmp_path / "exact.pdf"
+    over = tmp_path / "over.pdf"
+    write_pdf(exact, pages=500)
+    write_pdf(over, pages=501)
+
+    exact_body = post_file(client, app, exact).json()
+    over_body = post_file(client, app, over).json()
+
+    assert exact_body["page_count"] == 500
+    assert over_body["page_count"] == 501
+    assert not (exact_body["page_count"] > 500 or exact_body["byte_size"] > BYTE_LIMIT)
+    assert over_body["page_count"] > 500
+
+
+def test_byte_size_boundary_for_large_pdf(env, tmp_path):
+    client, app, _session = env
+    exact = tmp_path / "exact-bytes.pdf"
+    over = tmp_path / "over-bytes.pdf"
+    write_padded_pdf(exact, BYTE_LIMIT)
+    write_padded_pdf(over, BYTE_LIMIT + 1)
+
+    exact_body = post_file(client, app, exact).json()
+    over_body = post_file(client, app, over).json()
+
+    assert exact_body["byte_size"] == BYTE_LIMIT
+    assert over_body["byte_size"] == BYTE_LIMIT + 1
+    assert exact_body["page_count"] == 1
+    assert not (exact_body["page_count"] > 500 or exact_body["byte_size"] > BYTE_LIMIT)
+    assert over_body["byte_size"] > BYTE_LIMIT
+
+
+def test_same_bytes_are_duplicate_and_share_one_copy(env, tmp_path):
+    client, app, session = env
+    source = tmp_path / "same.pdf"
+    write_pdf(source, pages=1)
+    first = post_file(client, app, source).json()
+    second = post_file(client, app, source).json()
+
+    assert first["duplicate"] is False
+    assert second["duplicate"] is True
+    added = post_command(
+        client,
+        app,
+        {"type": "append_documents", "document_ids": [first["document_id"], second["document_id"]]},
+    )
+    assert added.status_code == 200
+    assert len(added.json()["documents"]) == 2
+    assert len(list(session.temp_dir.iterdir())) == 1
+
+
+def test_same_encrypted_bytes_share_one_decrypted_copy(env, tmp_path):
+    client, app, session = env
+    source = tmp_path / "secret.pdf"
+    write_encrypted_pdf(source)
+    first = post_file(client, app, source).json()
+    second = post_file(client, app, source).json()
+    assert first["needs_password"] is True
+    assert second["needs_password"] is True
+    assert len(list(session.temp_dir.iterdir())) == 2
+
+    assert post_password(client, app, first["document_id"], "secret").json()["needs_password"] is False
+    opened = post_password(client, app, second["document_id"], "secret")
+    assert opened.status_code == 200
+    assert opened.json()["needs_password"] is False
+    assert len(list(session.temp_dir.iterdir())) == 1
+
+    added = post_command(
+        client,
+        app,
+        {"type": "append_documents", "document_ids": [first["document_id"], second["document_id"]]},
+    )
+    assert added.status_code == 200
+    assert len(added.json()["documents"]) == 2
+    assert len(list(session.temp_dir.iterdir())) == 1
+
+    assert post_command(client, app, {"type": "undo"}).status_code == 200
+    assert client.get("/api/session", headers=auth(app)).json()["documents"] == []
+
+
+def test_undo_one_shared_copy_keeps_the_other_readable(env, tmp_path):
+    client, app, session = env
+    source = tmp_path / "same.pdf"
+    write_pdf(source, pages=1)
+    first = load_pdf(client, app, source)
+    first_id = first["documents"][0]["id"]
+    second = post_file(client, app, source).json()
+    added = post_command(client, app, {"type": "append_documents", "document_ids": [second["document_id"]]})
+    assert added.status_code == 200
+    assert len(added.json()["documents"]) == 2
+    assert len(list(session.temp_dir.iterdir())) == 1
+
+    undone = post_command(client, app, {"type": "undo"})
+    assert undone.status_code == 200
+    assert [document["id"] for document in undone.json()["documents"]] == [first_id]
+    opened = client.get(f"/api/session/files/{first_id}", headers=auth(app))
+    assert opened.status_code == 200
+    assert len(list(session.temp_dir.iterdir())) == 1
+
+
+def test_undone_bytes_are_not_duplicate_but_share_the_copy(env, tmp_path):
+    client, app, session = env
+    source = tmp_path / "same.pdf"
+    write_pdf(source, pages=1)
+    load_pdf(client, app, source)
+    assert post_command(client, app, {"type": "undo"}).status_code == 200
+
+    again = post_file(client, app, source).json()
+
+    assert again["duplicate"] is False
+    assert len(list(session.temp_dir.iterdir())) == 1
+
+
+def test_discard_keeps_a_shared_copy_another_document_uses(env, tmp_path):
+    client, app, session = env
+    source = tmp_path / "same.pdf"
+    write_pdf(source, pages=1)
+    loaded = load_pdf(client, app, source)
+    document_id = loaded["documents"][0]["id"]
+    extra = post_file(client, app, source).json()
+    assert extra["duplicate"] is True
+    assert len(list(session.temp_dir.iterdir())) == 1
+
+    discarded = client.post(
+        "/api/documents/discard",
+        headers=auth(app),
+        json={"document_ids": [extra["document_id"]]},
+    )
+
+    assert discarded.status_code == 200
+    assert len(list(session.temp_dir.iterdir())) == 1
+    opened = client.get(f"/api/session/files/{document_id}", headers=auth(app))
+    assert opened.status_code == 200
+
+
+def test_failed_decrypt_save_keeps_encrypted_intake_and_shared_copy(env, tmp_path):
+    client, app, session = env
+    source = tmp_path / "secret.pdf"
+    write_encrypted_pdf(source)
+    first = post_file(client, app, source).json()
+    assert post_password(client, app, first["document_id"], "secret").status_code == 200
+    added = post_command(client, app, {"type": "append_documents", "document_ids": [first["document_id"]]})
+    assert added.status_code == 200
+    plain = stored_copies(session)
+    before = client.get("/api/session", headers=auth(app)).json()
+
+    second = post_file(client, app, source).json()
+    assert second["needs_password"] is True
+    held = stored_copies(session)
+    assert len(held) == 2
+
+    def fail_save() -> None:
+        raise OSError("no space left and secret")
+
+    session.fail_decrypt_save = fail_save
+    failed = post_password(client, app, second["document_id"], "secret")
+    session.fail_decrypt_save = None
+
+    assert failed.status_code == 400
+    assert failed.json()["detail"] == "PDF を保存できませんでした"
+    assert "secret" not in failed.text
+    assert client.get("/api/session", headers=auth(app)).json() == before
+    assert stored_copies(session) == held
+    assert plain.keys() <= held.keys()
+    for name, content in plain.items():
+        assert held[name] == content
+
+    recovered = post_password(client, app, second["document_id"], "secret")
+    assert recovered.status_code == 200
+    assert recovered.json()["needs_password"] is False
+    assert stored_copies(session) == plain

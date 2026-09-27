@@ -1,3 +1,4 @@
+import hashlib
 import shutil
 import tempfile
 import threading
@@ -44,10 +45,12 @@ class Session:
         self._history_drop_notified = False
         self._intakes: dict[str, dict[str, object]] = {}
         self._copies: dict[str, Path] = {}
+        self._hashes: dict[str, str] = {}
         self._catalog: dict[str, str] = {}
         self._baseline: list[tuple[str, int, int]] = []
         self.pause_during_load = None
         self.before_commit = None
+        self.fail_decrypt_save = None
         self._assign_selection([], None)
 
     def startup(self) -> None:
@@ -63,6 +66,7 @@ class Session:
             self._history_drop_notified = False
             self._intakes = {}
             self._copies = {}
+            self._hashes = {}
             self._catalog = {}
             self._baseline = []
             self._activity = Activity.IDLE
@@ -286,6 +290,9 @@ class Session:
         for document_id in document_ids:
             if document_id in workspace:
                 return "すでに作業領域にある PDF は追加できません"
+            intake = self._intakes.get(document_id)
+            if intake is not None and intake["needs_password"]:
+                return "パスワードの確認が終わっていない PDF は追加できません"
             if document_id not in self._intakes and document_id not in self._catalog:
                 return "受け取っていない PDF は追加できません"
         return None
@@ -612,63 +619,258 @@ class Session:
             for document_id in document_ids:
                 if document_id not in self._intakes:
                     return 400, {"detail": "作業領域へ入れていない受け取りだけを破棄できます"}
-            paths = [self._copies.pop(document_id) for document_id in document_ids]
+            removed: list[Path] = []
             for document_id in document_ids:
+                removed.append(self._copies.pop(document_id))
                 del self._intakes[document_id]
-        for path in paths:
+                del self._hashes[document_id]
+            doomed = self._unreferenced(removed)
+        for path in doomed:
             path.unlink(missing_ok=True)
         return 200, {"discarded": list(document_ids)}
 
     def accept_upload(self, data: bytes, filename: str) -> tuple[int, dict]:
         if not self.try_begin(Activity.LOADING):
             return 409, {"detail": "読み込み中、ダイアログ中、または書き出し中のため受け付けられません"}
-        staging: Path | None = None
         try:
             if self.pause_during_load is not None:
                 self.pause_during_load()
-            staging, page_count = self._stage(data, filename)
-            document_id = self._store_intake(Path(filename).name, page_count, staging)
-            if document_id is None:
-                staging.unlink(missing_ok=True)
+            prepared = self._prepare_upload(data, filename)
+            stored = self._store_intake(prepared)
+            if stored is None:
+                if prepared["owns_file"]:
+                    prepared["path"].unlink(missing_ok=True)
                 return 409, {"detail": "書き出し中のため、読み込みを確定できませんでした"}
-            staging = None
-            return 200, {"document_id": document_id}
+            return 200, stored
         except LoadError as exc:
-            if staging is not None:
-                staging.unlink(missing_ok=True)
             return 400, {"detail": str(exc)}
         finally:
             self.finish(Activity.LOADING)
 
-    def _store_intake(self, filename: str, page_count: int, staging: Path) -> str | None:
+    def submit_password(self, document_id: str, body: object) -> tuple[int, dict]:
+        if not isinstance(body, dict) or set(body) != {"password"} or not isinstance(body.get("password"), str):
+            return 400, {"detail": "パスワードの指定が不正です"}
+        password = body["password"]
+        try:
+            with self._lock:
+                refused = self._password_refusal(document_id)
+                if refused is not None:
+                    return refused
+                encrypted = self._copies[document_id]
+            try:
+                decrypted, page_count, signed = self._decrypt(encrypted, password)
+            except LoadError as exc:
+                return 400, {"detail": str(exc)}
+            with self._lock:
+                if self._activity in {Activity.DIALOG, Activity.EXPORTING}:
+                    decrypted.unlink(missing_ok=True)
+                    return 409, {"detail": "ダイアログ中、または書き出し中のためパスワードを受け付けられません"}
+                intake = self._intakes.get(document_id)
+                if intake is None or not intake["needs_password"] or self._copies.get(document_id) != encrypted:
+                    decrypted.unlink(missing_ok=True)
+                    return 400, {"detail": "パスワードの確認が終わっていない受け取りではありません"}
+                self._adopt_decrypted(document_id, decrypted, page_count, signed)
+                return 200, self._intake_payload(document_id)
+        finally:
+            del password
+
+    def _password_refusal(self, document_id: str) -> tuple[int, dict] | None:
+        if self._activity in {Activity.DIALOG, Activity.EXPORTING}:
+            return 409, {"detail": "ダイアログ中、または書き出し中のためパスワードを受け付けられません"}
+        if document_id not in self._intakes:
+            if document_id in self._workspace_ids() or document_id in self._catalog:
+                return 400, {"detail": "作業領域にある PDF のパスワードは受け付けられません"}
+            return 400, {"detail": "受け取っていない PDF です"}
+        if not self._intakes[document_id]["needs_password"]:
+            return 400, {"detail": "この PDF に開くパスワードは不要です"}
+        return None
+
+    def _decrypt(self, encrypted: Path, password: str) -> tuple[Path, int, bool]:
+        try:
+            with pikepdf.open(encrypted, password=password) as pdf:
+                signed = _is_signed(pdf)
+                page_count = len(pdf.pages)
+                decrypted = self.temp_dir / f"incoming-{uuid4().hex}.pdf"
+                try:
+                    if self.fail_decrypt_save is not None:
+                        decrypted.write_bytes(b"partial")
+                        self.fail_decrypt_save()
+                    pdf.save(decrypted, compress_streams=False)
+                except Exception:
+                    decrypted.unlink(missing_ok=True)
+                    raise LoadError("PDF を保存できませんでした") from None
+        except pikepdf.PasswordError:
+            raise LoadError("パスワードが違います") from None
+        except pikepdf.PdfError:
+            raise LoadError("PDF を開けませんでした") from None
+        return decrypted, page_count, signed
+
+    def _adopt_decrypted(self, document_id: str, decrypted: Path, page_count: int, signed: bool) -> None:
+        digest = self._hashes[document_id]
+        shared = self._plain_path(digest, skip=document_id)
+        chosen = decrypted
+        if shared is not None and shared != decrypted:
+            decrypted.unlink(missing_ok=True)
+            chosen = shared
+        previous = self._copies[document_id]
+        self._copies[document_id] = chosen
+        intake = self._intakes[document_id]
+        intake["needs_password"] = False
+        intake["page_count"] = page_count
+        intake["signed"] = signed
+        if previous != chosen and not self._referenced(previous):
+            previous.unlink(missing_ok=True)
+
+    def _store_intake(self, prepared: dict[str, object]) -> dict[str, object] | None:
         if self.before_commit is not None:
             self.before_commit()
         with self._lock:
             if self._activity is not Activity.LOADING:
                 return None
             document_id = uuid4().hex
-            self._intakes[document_id] = {"filename": filename, "page_count": page_count}
-            self._copies[document_id] = staging
-            return document_id
+            self._intakes[document_id] = {
+                "filename": prepared["filename"],
+                "page_count": prepared["page_count"],
+                "needs_password": prepared["needs_password"],
+                "signed": prepared["signed"],
+                "byte_size": prepared["byte_size"],
+                "duplicate": prepared["duplicate"],
+            }
+            self._copies[document_id] = prepared["path"]
+            self._hashes[document_id] = prepared["digest"]
+            return self._intake_payload(document_id)
 
-    def _stage(self, data: bytes, filename: str) -> tuple[Path, int]:
+    def _prepare_upload(self, data: bytes, filename: str) -> dict[str, object]:
         safe_name = Path(filename).name
         if not safe_name.lower().endswith(".pdf"):
             raise LoadError("PDF 以外のファイルは読み込めません")
+        digest = hashlib.sha256(data).hexdigest()
+        byte_size = len(data)
         staging = self.temp_dir / f"incoming-{uuid4().hex}.pdf"
         staging.write_bytes(data)
         try:
             with pikepdf.open(staging) as pdf:
-                return staging, len(pdf.pages)
-        except pikepdf.PasswordError as exc:
+                page_count: int | None = len(pdf.pages)
+                signed = _is_signed(pdf)
+        except pikepdf.PasswordError:
+            with self._lock:
+                duplicate = self._is_duplicate(digest)
+            return {
+                "filename": safe_name,
+                "path": staging,
+                "owns_file": True,
+                "page_count": None,
+                "needs_password": True,
+                "signed": False,
+                "byte_size": byte_size,
+                "duplicate": duplicate,
+                "digest": digest,
+            }
+        except pikepdf.PdfError:
             staging.unlink(missing_ok=True)
-            raise LoadError("パスワードが必要な PDF は、この操作では開けません") from exc
-        except pikepdf.PdfError as exc:
-            staging.unlink(missing_ok=True)
-            raise LoadError("PDF を開けませんでした") from exc
+            raise LoadError("PDF を開けませんでした") from None
         except Exception:
             staging.unlink(missing_ok=True)
             raise
+        with self._lock:
+            duplicate = self._is_duplicate(digest)
+            shared = self._plain_path(digest)
+        path = staging
+        owns_file = True
+        if shared is not None:
+            staging.unlink(missing_ok=True)
+            path = shared
+            owns_file = False
+        return {
+            "filename": safe_name,
+            "path": path,
+            "owns_file": owns_file,
+            "page_count": page_count,
+            "needs_password": False,
+            "signed": signed,
+            "byte_size": byte_size,
+            "duplicate": duplicate,
+            "digest": digest,
+        }
+
+    def _intake_payload(self, document_id: str) -> dict[str, object]:
+        intake = self._intakes[document_id]
+        return {
+            "document_id": document_id,
+            "needs_password": bool(intake["needs_password"]),
+            "byte_size": int(intake["byte_size"]),
+            "page_count": intake["page_count"],
+            "signed": bool(intake["signed"]),
+            "duplicate": bool(intake["duplicate"]),
+        }
+
+    def _is_duplicate(self, digest: str) -> bool:
+        workspace = self._workspace_ids()
+        for document_id, existing in self._hashes.items():
+            if existing != digest:
+                continue
+            if document_id in workspace or document_id in self._intakes:
+                return True
+        return False
+
+    def _plain_path(self, digest: str, skip: str | None = None) -> Path | None:
+        for document_id, existing in self._hashes.items():
+            if document_id == skip or existing != digest:
+                continue
+            intake = self._intakes.get(document_id)
+            if intake is not None and intake["needs_password"]:
+                continue
+            path = self._copies.get(document_id)
+            if path is not None and path.is_file():
+                return path
+        return None
+
+    def _referenced(self, path: Path) -> bool:
+        return any(existing == path for existing in self._copies.values())
+
+    def _unreferenced(self, paths: list[Path]) -> list[Path]:
+        doomed: list[Path] = []
+        seen: set[Path] = set()
+        for path in paths:
+            if path in seen:
+                continue
+            seen.add(path)
+            if not self._referenced(path):
+                doomed.append(path)
+        return doomed
+
+def _is_signed(pdf: pikepdf.Pdf) -> bool:
+    root = pdf.Root
+    perms = root.get("/Perms")
+    if isinstance(perms, pikepdf.Dictionary) and perms.get("/DocMDP") is not None:
+        return True
+    acro = root.get("/AcroForm")
+    if not isinstance(acro, pikepdf.Dictionary):
+        return False
+    flags = acro.get("/SigFlags")
+    if flags is not None:
+        try:
+            if int(flags) != 0:
+                return True
+        except (TypeError, ValueError):
+            pass
+    return _has_sig_field(acro.get("/Fields"), set())
+
+
+def _has_sig_field(node: object, seen: set[int]) -> bool:
+    if isinstance(node, pikepdf.Array):
+        return any(_has_sig_field(item, seen) for item in node)
+    if not isinstance(node, pikepdf.Dictionary):
+        return False
+    marker = id(node)
+    if marker in seen:
+        return False
+    seen.add(marker)
+    field_type = node.get("/FT")
+    if field_type is not None and str(field_type) == "/Sig":
+        return True
+    return _has_sig_field(node.get("/Kids"), seen)
+
 
 def _operation_phrase(command: object) -> str:
     if not isinstance(command, dict):

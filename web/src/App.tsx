@@ -11,6 +11,7 @@ import {
   postCommand,
   postDocument,
   postExport,
+  postPassword,
   putSettings,
   readToken,
 } from "./api";
@@ -28,7 +29,15 @@ import {
   singleSelection,
   type PageSelection,
 } from "./selection";
-import type { EditCommand, ExportJob, SessionState, ThumbnailLayout, ThumbnailSize, ViewSettings } from "./types";
+import type {
+  DocumentIntake,
+  EditCommand,
+  ExportJob,
+  SessionState,
+  ThumbnailLayout,
+  ThumbnailSize,
+  ViewSettings,
+} from "./types";
 import type { ReorderAnchor } from "./reorder";
 import { changeZoom, formatPercent, initialZoom, zoomUnchanged, type NamedZoom, type ZoomMetrics, type ZoomState } from "./zoom";
 
@@ -77,8 +86,171 @@ function delay(ms: number): Promise<void> {
   });
 }
 
+const PAGE_LIMIT = 500;
+const BYTE_LIMIT = 100 * 1024 * 1024;
+
+type DialogState =
+  | { kind: "password"; filename: string; documentId: string; error: string | null }
+  | { kind: "confirm"; message: string; confirmLabel: string };
+
+type DialogAnswer = DocumentIntake | "confirm" | "cancel" | "abort" | { failed: string };
+
 function isTextField(target: EventTarget | null): boolean {
   return target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement;
+}
+
+function largeMessage(filename: string, intake: DocumentIntake): string | null {
+  const pagesOver = intake.page_count != null && intake.page_count > PAGE_LIMIT;
+  const bytesOver = intake.byte_size > BYTE_LIMIT;
+  if (pagesOver && bytesOver && intake.page_count != null) {
+    return `${filename} は ${intake.page_count} ページ、${intake.byte_size} バイトあり、500 ページと 100MB（100 × 1024 × 1024 バイト）を超えています。作業領域へ入れますか？`;
+  }
+  if (pagesOver && intake.page_count != null) {
+    return `${filename} は ${intake.page_count} ページあり、500 ページを超えています。作業領域へ入れますか？`;
+  }
+  if (bytesOver) {
+    return `${filename} は ${intake.byte_size} バイトあり、100MB（100 × 1024 × 1024 バイト）を超えています。作業領域へ入れますか？`;
+  }
+  return null;
+}
+
+function EyeIcon({ open }: { open: boolean }) {
+  return (
+    <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+      <path
+        d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12z"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+      />
+      <circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" strokeWidth="2" />
+      {open ? null : <path d="M4 20L20 4" stroke="currentColor" strokeWidth="2" />}
+    </svg>
+  );
+}
+
+function PasswordDialog({
+  filename,
+  error,
+  onSubmit,
+  onCancel,
+}: {
+  filename: string;
+  error: string | null;
+  onSubmit: (password: string) => Promise<void>;
+  onCancel: () => void;
+}) {
+  const [password, setPassword] = useState("");
+  const [visible, setVisible] = useState(false);
+  const [pending, setPending] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    inputRef.current?.focus();
+  }, []);
+  return (
+    <div className="modal-backdrop">
+      <form
+        className="modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="password-title"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (pending) {
+            return;
+          }
+          setPending(true);
+          void onSubmit(password).finally(() => setPending(false));
+        }}
+        onKeyDown={(event) => {
+          if (event.key === "Escape") {
+            event.preventDefault();
+            event.stopPropagation();
+            onCancel();
+          }
+        }}
+      >
+        <p id="password-title">{filename} を開くパスワードを入力してください。</p>
+        {error ? <p className="modal-error">{error}</p> : null}
+        <div className="password-row">
+          <input
+            ref={inputRef}
+            aria-label="パスワード"
+            type={visible ? "text" : "password"}
+            value={password}
+            onChange={(event) => setPassword(event.target.value)}
+          />
+          <button
+            type="button"
+            className="eye-button"
+            aria-label={visible ? "パスワードを隠す" : "パスワードを表示"}
+            onClick={() => setVisible((current) => !current)}
+          >
+            <EyeIcon open={visible} />
+          </button>
+        </div>
+        <div className="modal-actions">
+          <button type="submit">開く</button>
+          <button type="button" onClick={onCancel}>
+            キャンセル
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+function ConfirmDialog({
+  message,
+  confirmLabel,
+  onConfirm,
+  onCancel,
+}: {
+  message: string;
+  confirmLabel: string;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const confirmRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    confirmRef.current?.focus();
+  }, []);
+  return (
+    <div className="modal-backdrop">
+      <form
+        className="modal"
+        role="dialog"
+        aria-modal="true"
+        onSubmit={(event) => {
+          event.preventDefault();
+          onConfirm();
+        }}
+        onKeyDown={(event) => {
+          if (event.key === "Escape") {
+            event.preventDefault();
+            event.stopPropagation();
+            onCancel();
+            return;
+          }
+          if (event.key === "Enter") {
+            event.preventDefault();
+            event.stopPropagation();
+            onConfirm();
+          }
+        }}
+      >
+        <p>{message}</p>
+        <div className="modal-actions">
+          <button type="submit" ref={confirmRef}>
+            {confirmLabel}
+          </button>
+          <button type="button" onClick={onCancel}>
+            キャンセル
+          </button>
+        </div>
+      </form>
+    </div>
+  );
 }
 
 function TipButton({
@@ -113,6 +285,7 @@ export function App() {
   const [pdfs, setPdfs] = useState<Map<string, PDFDocumentProxy>>(new Map());
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [dialog, setDialog] = useState<DialogState | null>(null);
   const [waiting, setWaiting] = useState<string | null>(null);
   const [progress, setProgress] = useState<ExportJob | null>(null);
   const [saved, setSaved] = useState<{ jobId: string; path: string } | null>(null);
@@ -138,6 +311,8 @@ export function App() {
   const busyRef = useRef(busy);
   const loadingRef = useRef(false);
   const abortRef = useRef(false);
+  const dialogRef = useRef<DialogState | null>(null);
+  const pendingDialog = useRef<((answer: DialogAnswer) => void) | null>(null);
   const pdfsRef = useRef<Map<string, PDFDocumentProxy>>(new Map());
   const toastTimer = useRef(0);
   zoomRef.current = zoom;
@@ -147,6 +322,7 @@ export function App() {
   columnsRef.current = columns;
   busyRef.current = busy;
   loadingRef.current = loading;
+  dialogRef.current = dialog;
 
   const pages = visiblePages(session.pages);
   const names = useMemo(
@@ -361,6 +537,12 @@ export function App() {
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
+      if (dialogRef.current) {
+        if (event.key === "Escape") {
+          event.preventDefault();
+        }
+        return;
+      }
       if (isTextField(event.target) || busyRef.current) {
         return;
       }
@@ -453,6 +635,122 @@ export function App() {
     return () => window.removeEventListener("wheel", onWheel);
   }, [token]);
 
+  function finishDialog(answer: DialogAnswer) {
+    const resolve = pendingDialog.current;
+    if (!resolve) {
+      return;
+    }
+    pendingDialog.current = null;
+    setDialog(null);
+    resolve(answer);
+  }
+
+  function requestDialog(next: DialogState): Promise<DialogAnswer> {
+    return new Promise((resolve) => {
+      pendingDialog.current = resolve;
+      setDialog(next);
+    });
+  }
+
+  function abortLoading() {
+    abortRef.current = true;
+    finishDialog("abort");
+  }
+
+  async function submitPasswordDialog(documentId: string, password: string) {
+    try {
+      const intake = await postPassword(token, documentId, password);
+      if (abortRef.current) {
+        return;
+      }
+      finishDialog(intake);
+    } catch (reason: unknown) {
+      if (abortRef.current) {
+        return;
+      }
+      if (reason instanceof ApiError && reason.status === 400 && reason.message === "パスワードが違います") {
+        setDialog((current) =>
+          current && current.kind === "password"
+            ? { ...current, error: "パスワードが違います。もう一度入力してください。" }
+            : current,
+        );
+        return;
+      }
+      const message = reason instanceof Error ? reason.message : "読み込めませんでした";
+      finishDialog({ failed: message });
+    }
+  }
+
+  async function considerFile(file: File): Promise<"cancel" | "abort" | { id: string } | { error: string }> {
+    let intake: DocumentIntake;
+    try {
+      intake = await postDocument(token, file);
+    } catch (reason: unknown) {
+      const detail = reason instanceof Error ? reason.message : "読み込めませんでした";
+      return { error: detail };
+    }
+    if (abortRef.current) {
+      await discardDocuments(token, [intake.document_id]);
+      return "abort";
+    }
+    if (intake.needs_password) {
+      const answer = await requestDialog({
+        kind: "password",
+        filename: file.name,
+        documentId: intake.document_id,
+        error: null,
+      });
+      if (answer === "cancel" || answer === "abort") {
+        await discardDocuments(token, [intake.document_id]);
+        return answer;
+      }
+      if (typeof answer === "object" && "failed" in answer) {
+        await discardDocuments(token, [intake.document_id]);
+        return { error: answer.failed };
+      }
+      if (!(typeof answer === "object" && "document_id" in answer)) {
+        await discardDocuments(token, [intake.document_id]);
+        return "abort";
+      }
+      intake = answer;
+    }
+    if (abortRef.current) {
+      await discardDocuments(token, [intake.document_id]);
+      return "abort";
+    }
+    if (intake.signed) {
+      const answer = await requestDialog({
+        kind: "confirm",
+        message: `${file.name} は電子署名 PDF です。編集して書き出すと、署名が有効でなくなる可能性があります。作業領域へ入れますか？`,
+        confirmLabel: "入れる",
+      });
+      if (answer !== "confirm") {
+        await discardDocuments(token, [intake.document_id]);
+        return answer === "cancel" ? "cancel" : "abort";
+      }
+    }
+    const prompt = largeMessage(file.name, intake);
+    if (prompt) {
+      const answer = await requestDialog({ kind: "confirm", message: prompt, confirmLabel: "入れる" });
+      if (answer !== "confirm") {
+        await discardDocuments(token, [intake.document_id]);
+        return answer === "cancel" ? "cancel" : "abort";
+      }
+    }
+    if (intake.duplicate) {
+      const answer = await requestDialog({
+        kind: "confirm",
+        message: `${file.name} は、同じ内容の PDF がすでにあります。追加しますか？`,
+        confirmLabel: "追加する",
+      });
+      if (answer !== "confirm") {
+        await discardDocuments(token, [intake.document_id]);
+        return answer === "cancel" ? "cancel" : "abort";
+      }
+    }
+    return { id: intake.document_id };
+  }
+
   async function addFiles(files: File[]) {
     if (loadingRef.current || busyRef.current || files.length === 0) {
       return;
@@ -463,48 +761,59 @@ export function App() {
     setError(null);
     setSaved(null);
     setProgress(null);
-    const received: string[] = [];
+    const accepted: string[] = [];
     const failures: string[] = [];
     try {
       for (const file of files) {
         if (abortRef.current) {
           break;
         }
-        try {
-          const result = await postDocument(token, file);
-          received.push(result.document_id);
-        } catch (reason: unknown) {
-          const detail = reason instanceof Error ? reason.message : "読み込めませんでした";
-          failures.push(`${file.name}: ${detail}`);
+        const outcome = await considerFile(file);
+        if (outcome === "abort") {
+          break;
         }
+        if (outcome === "cancel") {
+          continue;
+        }
+        if ("error" in outcome) {
+          failures.push(`${file.name}: ${outcome.error}`);
+          continue;
+        }
+        accepted.push(outcome.id);
       }
       if (abortRef.current) {
-        if (received.length > 0) {
-          await discardDocuments(token, received);
+        if (accepted.length > 0) {
+          await discardDocuments(token, accepted);
         }
         return;
       }
-      if (received.length === 0) {
+      if (accepted.length === 0) {
         if (failures.length > 0) {
           setError(failures.join("\n"));
         }
         return;
       }
       const ticket = ++ticketRef.current;
-      const next = await postCommand(token, { type: "append_documents", document_ids: received });
+      const next = await postCommand(token, { type: "append_documents", document_ids: accepted });
+      if (abortRef.current) {
+        // 送信済みの追加は、中止が押された時点では戻せないので Undo で作業領域を戻す。
+        const undone = await postCommand(token, { type: "undo" });
+        publishSession(undone, ticket);
+        return;
+      }
       if (!publishSession(next, ticket)) {
         return;
       }
       if (failures.length > 0) {
         setError(failures.join("\n"));
       } else {
-        showToast(`${received.length}件の PDF を追加しました`);
+        showToast(`${accepted.length}件の PDF を追加しました`);
       }
     } catch (reason: unknown) {
       const message = reason instanceof Error ? reason.message : "読み込めませんでした";
-      if (!abortRef.current && received.length > 0) {
+      if (!abortRef.current && accepted.length > 0) {
         try {
-          await discardDocuments(token, received);
+          await discardDocuments(token, accepted);
         } catch (discardReason: unknown) {
           const extra = discardReason instanceof Error ? discardReason.message : "受け取った PDF を破棄できませんでした";
           setError(`${message}\n${extra}`);
@@ -513,6 +822,7 @@ export function App() {
       }
       setError(message);
     } finally {
+      finishDialog("abort");
       loadingRef.current = false;
       abortRef.current = false;
       setLoading(false);
@@ -528,7 +838,7 @@ export function App() {
 
   function onDrop(event: DragEvent<HTMLDivElement>) {
     event.preventDefault();
-    if (loadingRef.current || busyRef.current) {
+    if (loadingRef.current || busyRef.current || dialogRef.current) {
       return;
     }
     void addFiles([...event.dataTransfer.files]);
@@ -735,7 +1045,7 @@ export function App() {
             type="file"
             accept="application/pdf,.pdf"
             multiple
-            disabled={loading || busy}
+            disabled={loading || busy || dialog !== null}
             onChange={(event) => {
               const files = [...(event.target.files ?? [])];
               event.target.value = "";
@@ -744,7 +1054,7 @@ export function App() {
           />
         </label>
         {loading ? (
-          <button type="button" onClick={() => (abortRef.current = true)}>
+          <button type="button" onClick={abortLoading}>
             読み込みを中止
           </button>
         ) : null}
@@ -966,6 +1276,23 @@ export function App() {
           ) : null}
         </section>
       </div>
+      {dialog?.kind === "password" ? (
+        <PasswordDialog
+          key={dialog.documentId}
+          filename={dialog.filename}
+          error={dialog.error}
+          onSubmit={(password) => submitPasswordDialog(dialog.documentId, password)}
+          onCancel={() => finishDialog("cancel")}
+        />
+      ) : null}
+      {dialog?.kind === "confirm" ? (
+        <ConfirmDialog
+          message={dialog.message}
+          confirmLabel={dialog.confirmLabel}
+          onConfirm={() => finishDialog("confirm")}
+          onCancel={() => finishDialog("cancel")}
+        />
+      ) : null}
     </div>
   );
 }

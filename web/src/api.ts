@@ -1,4 +1,12 @@
-import type { CommandResult, EditCommand, ExportJob, ExportStart, SessionState, ViewSettings } from "./types";
+import type {
+  CommandResult,
+  DocumentIntake,
+  EditCommand,
+  ExportJob,
+  ExportStart,
+  SessionState,
+  ViewSettings,
+} from "./types";
 
 export class ApiError extends Error {
   readonly status: number;
@@ -68,12 +76,20 @@ export function getSession(token: string): Promise<SessionState> {
   return request(token, "/api/session").then((response) => readJson<SessionState>(response));
 }
 
-export function postDocument(token: string, file: File): Promise<{ document_id: string }> {
+export function postDocument(token: string, file: File): Promise<DocumentIntake> {
   const body = new FormData();
   body.append("file", file);
   return request(token, "/api/documents", { method: "POST", body }).then((response) =>
-    readJson<{ document_id: string }>(response),
+    readJson<DocumentIntake>(response),
   );
+}
+
+export function postPassword(token: string, documentId: string, password: string): Promise<DocumentIntake> {
+  return request(token, `/api/documents/${documentId}/password`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ password }),
+  }).then((response) => readJson<DocumentIntake>(response));
 }
 
 export function discardDocuments(token: string, documentIds: string[]): Promise<{ discarded: string[] }> {

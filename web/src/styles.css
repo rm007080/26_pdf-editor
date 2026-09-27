@@ -30,6 +30,8 @@ input {
 }
 
 .toolbar {
+  position: relative;
+  z-index: 30;
   display: flex;
   flex-wrap: wrap;
   gap: 0.75rem;
@@ -312,4 +314,66 @@ input {
   flex-wrap: wrap;
   gap: 0.6rem;
   align-items: center;
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(36, 48, 40, 0.45);
+  padding: 1rem;
+}
+
+.modal {
+  width: min(32rem, 100%);
+  background: #fffaf3;
+  color: #1d1914;
+  border-radius: 1rem;
+  padding: 1.25rem;
+}
+
+.modal p {
+  margin: 0 0 1rem;
+}
+
+.modal-error {
+  color: #8a2e16;
+}
+
+.password-row,
+.modal-actions {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.password-row input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  border-radius: 999px;
+  padding: 0.45rem 0.8rem;
+  color: #243028;
+}
+
+.modal button,
+.eye-button {
+  border: 0;
+  border-radius: 999px;
+  padding: 0.4rem 0.85rem;
+  background: #243028;
+  color: #f6f1e7;
+  cursor: pointer;
+}
+
+.eye-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.5rem;
+  height: 2.5rem;
+  padding: 0;
 }

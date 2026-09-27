@@ -29,6 +29,15 @@ export type CommandResult = SessionState & {
   history_dropped: boolean;
 };
 
+export type DocumentIntake = {
+  document_id: string;
+  needs_password: boolean;
+  byte_size: number;
+  page_count: number | null;
+  signed: boolean;
+  duplicate: boolean;
+};
+
 export type EditCommand =
   | { type: "rotate"; page_ids: string[]; direction: "left" | "right" }
   | { type: "delete"; page_ids: string[] }
