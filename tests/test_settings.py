@@ -338,6 +338,75 @@ def test_open_pdfs_cancel_leaves_edit_state_and_folder(env, tmp_path):
     assert not path.exists() or json.loads(path.read_text(encoding="utf-8")).get("last_open_dir") is None
 
 
+def test_file_dialog_hook_brings_open_dialog_forward(monkeypatch):
+    from app import save_dialog
+
+    seen: list[int] = []
+    closed: list[int] = []
+    monkeypatch.setattr(save_dialog, "_dialog_window", lambda _hwnd: 99)
+    monkeypatch.setattr(save_dialog, "_force_foreground", seen.append)
+    monkeypatch.setattr(save_dialog, "_post_close", closed.append)
+    save_dialog._showing_kind = "open"
+    try:
+        assert save_dialog._on_file_dialog(1, save_dialog._WM_INITDIALOG, 0, 0) == 0
+        assert seen == [99]
+        assert save_dialog.cancel_open_dialog() is True
+        assert closed == [99]
+        save_dialog._dialogs.clear("open")
+        assert save_dialog.cancel_open_dialog() is False
+
+        save_dialog._showing_kind = "save"
+        save_dialog._on_file_dialog(1, save_dialog._WM_INITDIALOG, 0, 0)
+        assert save_dialog.cancel_open_dialog() is False
+        assert save_dialog._on_file_dialog(1, 0, 0, 0) == 0
+    finally:
+        save_dialog._dialogs.clear("open")
+        save_dialog._dialogs.clear("save")
+        save_dialog._showing_kind = None
+
+
+def test_second_open_pdfs_replaces_the_dialog_already_open(env, tmp_path, monkeypatch):
+    client, app, _session, _path = env
+    chosen = tmp_path / "next.pdf"
+    write_pdf(chosen, pages=1)
+    started = threading.Event()
+    release = threading.Event()
+    calls = {"n": 0}
+
+    def ask(_initial):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            started.set()
+            assert release.wait(5)
+            return None
+        return [chosen]
+
+    def dismiss() -> bool:
+        if not started.is_set():
+            return False
+        release.set()
+        return True
+
+    app.state.ask_open_pdfs = ask
+    monkeypatch.setattr("app.open_pdfs.cancel_open_dialog", dismiss)
+    holder: dict[str, object] = {}
+
+    def choose() -> None:
+        holder["response"] = client.post("/api/dialogs/open-pdfs", headers=auth(app))
+
+    worker = threading.Thread(target=choose)
+    worker.start()
+    assert started.wait(5)
+    second = client.post("/api/dialogs/open-pdfs", headers=auth(app))
+    worker.join(5)
+
+    assert holder["response"].status_code == 200
+    assert holder["response"].json()["status"] == "cancelled"
+    assert second.status_code == 200
+    assert second.json()["status"] == "ok"
+    assert second.json()["items"][0]["filename"] == "next.pdf"
+
+
 def test_open_pdfs_holds_dialog_and_rejects_upload(env, tmp_path):
     client, app, _session, _path = env
     source = tmp_path / "sample.pdf"

@@ -1,16 +1,32 @@
 import asyncio
+import time
 from pathlib import Path
 
 from app.folders import initial_directory, with_notice
+from app.save_dialog import cancel_open_dialog
 from app.session import Activity, Session
 from app.settings import SettingsStore
 
 OPEN_FAILURE = "ファイル選択を完了できませんでした"
+BUSY_DETAIL = "読み込み中、ダイアログ中、または書き出し中のため受け付けられません"
+
+
+async def _wait_until_idle(session: Session) -> bool:
+    deadline = time.monotonic() + 5
+    while session.current_activity() is not Activity.IDLE:
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(0.02)
+    return True
 
 
 async def open_selected_pdfs(session: Session, settings: SettingsStore, ask) -> tuple[int, dict]:
+    # 再読み込み後の「PDF を選ぶ」は、裏に残った選択を閉じ、この要求で開き直す。
+    if cancel_open_dialog():
+        if not await _wait_until_idle(session):
+            return 409, {"detail": BUSY_DETAIL}
     if not session.try_begin(Activity.DIALOG):
-        return 409, {"detail": "読み込み中、ダイアログ中、または書き出し中のため受け付けられません"}
+        return 409, {"detail": BUSY_DETAIL}
     received: list[str] = []
     try:
         initial, notice = initial_directory(settings.read()["last_open_dir"])
