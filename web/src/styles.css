@@ -84,6 +84,7 @@ input {
 }
 
 .chrome {
+  flex: 0 0 auto;
   background: var(--bar);
   color: var(--bar-ink);
   padding: 8px 16px;
@@ -99,19 +100,20 @@ input {
   position: relative;
   z-index: 30;
   display: flex;
-  flex-wrap: nowrap;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
   gap: 8px;
   align-items: center;
   padding: 8px 16px;
   background: var(--bar);
   color: var(--bar-ink);
-  overflow: hidden;
+  overflow: visible;
 }
 
 .tool,
 .toolbar button,
 .nav button,
-.overflow-menu summary,
+.toolbar-menu summary,
 .page button {
   display: inline-flex;
   align-items: center;
@@ -142,29 +144,10 @@ input {
   display: none !important;
 }
 
-.toolbar.icons-only .tool:has(.tool-icon) .tool-label {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  overflow: hidden;
-  clip: rect(0 0 0 0);
-  white-space: nowrap;
-}
-
-.overflow-menu .tool-label,
-.page .tool-label {
-  position: static;
-  width: auto;
-  height: auto;
-  overflow: visible;
-  clip: auto;
-}
-
 .tool-group,
 .tip,
 .jump,
-.export-menu,
-.overflow-menu {
+.toolbar-menu {
   flex: 0 0 auto;
   display: inline-flex;
   gap: 8px;
@@ -221,7 +204,7 @@ input {
   font-size: 14px;
 }
 
-.toolbar button[aria-pressed="true"] {
+.tool[aria-pressed="true"] {
   background: var(--pressed);
 }
 
@@ -245,20 +228,17 @@ input {
   color: #fff8f3;
 }
 
-.export-menu {
-  position: relative;
-}
-
-.export-menu summary {
+.toolbar-menu summary {
   list-style: none;
-  border-radius: 999px;
-  padding: 0.4rem 0.85rem;
-  background: #f6f1e7;
-  cursor: pointer;
 }
 
-.export-menu summary::-webkit-details-marker {
+.toolbar-menu summary::-webkit-details-marker {
   display: none;
+}
+
+.toolbar-menu summary[aria-disabled="true"] {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 details:not([open]) > .menu-panel {
@@ -266,16 +246,18 @@ details:not([open]) > .menu-panel {
 }
 
 .menu-panel {
-  position: absolute;
-  z-index: 5;
-  top: calc(100% + 0.35rem);
-  left: 0;
+  position: fixed;
+  z-index: 40;
   display: grid;
   gap: 0.35rem;
   min-width: 10rem;
+  width: max-content;
+  max-width: calc(100vw - 16px);
+  overflow: auto;
   padding: 0.45rem;
   border-radius: 0.8rem;
-  background: #fffaf3;
+  background: var(--notice);
+  color: var(--ink);
   box-shadow: 0 8px 24px rgba(36, 48, 40, 0.16);
 }
 
@@ -324,9 +306,10 @@ details:not([open]) > .menu-panel {
   opacity: 0.45;
 }
 
-.page-label,
-.zoom-label {
-  margin-left: auto;
+.toolbar > .page-label {
+  flex: 1 0 100%;
+  min-width: 0;
+  font-variant-numeric: tabular-nums;
 }
 
 .zoom-label {
@@ -355,7 +338,37 @@ details:not([open]) > .menu-panel {
   flex-direction: column;
 }
 
+.editor {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+}
+
+.thumbnail-toolbar {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  background: var(--thumb);
+}
+
+.thumbnail-heading {
+  margin-right: 8px;
+  font-weight: 600;
+}
+
+.tool:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 .stage {
+  flex: 0 0 auto;
   min-height: 240px;
   min-width: 0;
   display: flex;
@@ -370,6 +383,7 @@ details:not([open]) > .menu-panel {
 }
 
 .thumb-pane {
+  flex: 0 0 auto;
   min-height: 160px;
   min-width: 0;
   background: var(--thumb);
@@ -380,6 +394,8 @@ details:not([open]) > .menu-panel {
   min-width: 0;
   min-height: 0;
   overflow: auto;
+  /* 再描画中にスクロールバーが消えても、幅合わせの計測幅を変えない。 */
+  scrollbar-gutter: stable;
   display: flex;
   background: var(--stage);
   border: 1px solid var(--line);
@@ -561,7 +577,7 @@ details:not([open]) > .menu-panel {
 .modal-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 20;
+  z-index: 100;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -677,18 +693,6 @@ details:not([open]) > .menu-panel {
 .help-split {
   width: 4px;
   background: var(--accent);
-}
-
-.overflow-menu {
-  position: relative;
-}
-
-.overflow-menu summary {
-  list-style: none;
-}
-
-.overflow-menu summary::-webkit-details-marker {
-  display: none;
 }
 
 .app {
