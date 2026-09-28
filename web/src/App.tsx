@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent, type FormEvent, type PointerEvent as ReactPointerEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type FormEvent, type PointerEvent as ReactPointerEvent } from "react";
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import {
   ApiError,
@@ -30,8 +30,9 @@ import {
   putSettings,
   readToken,
 } from "./api";
-import { FRAME_HEIGHT, SPLITTER, oneRowHeight, paneHeights, ratioFromThumb } from "./panes";
+import { FRAME_HEIGHT, PREVIEW_MIN, THUMB_MIN, SPLITTER, oneRowHeight, paneHeights, ratioFromThumb } from "./panes";
 import { openDocumentPdf } from "./pdf";
+import { ToolbarMenu } from "./toolbar-menu";
 import { ThumbnailStrip, ZoomPreview, cancelThumbnailDrag, visiblePages } from "./Preview";
 import {
   clearSelection,
@@ -94,18 +95,6 @@ const defaultSettings: ViewSettings = {
 };
 
 type AppView = "edit" | "settings" | "help";
-
-const TOOLBAR_COLLAPSE_ORDER = [
-  "exit",
-  "start-fresh",
-  "layout",
-  "clear-splits",
-  "redo",
-  "undo",
-  "rotate-left",
-  "rotate-right",
-  "delete",
-] as const;
 
 const IDLE_CHOICES: { value: IdleMinutes; label: string }[] = [
   { value: 30, label: "30分" },
@@ -604,8 +593,6 @@ export function App() {
   const [held, setHeld] = useState<string[]>([]);
   const [about, setAbout] = useState<{ name: string; version: string; cleared_leftover: boolean } | null>(null);
   const [updateNote, setUpdateNote] = useState<string | null>(null);
-  const [iconsOnly, setIconsOnly] = useState(false);
-  const [overflow, setOverflow] = useState<string[]>([]);
   const [pdfs, setPdfs] = useState<Map<string, PDFDocumentProxy>>(new Map());
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -624,6 +611,7 @@ export function App() {
   const [zoom, setZoom] = useState<ZoomState>(initialZoom);
   const [metrics, setMetrics] = useState<ZoomMetrics | null>(null);
   const [workspaceHeight, setWorkspaceHeight] = useState(0);
+  const [thumbnailToolbarHeight, setThumbnailToolbarHeight] = useState(0);
   const [dragRatio, setDragRatio] = useState<number | null>(null);
   const [columns, setColumns] = useState(1);
   const workspaceRef = useRef<HTMLDivElement>(null);
@@ -639,7 +627,7 @@ export function App() {
   const resettingRef = useRef(false);
   const loadingRef = useRef(false);
   const pickingRef = useRef(false);
-  const toolbarRef = useRef<HTMLElement>(null);
+  const thumbnailToolbarRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef(false);
   const dialogRef = useRef<DialogState | null>(null);
   const namingRef = useRef<NamingState | null>(null);
@@ -686,7 +674,7 @@ export function App() {
   const activePdf = active ? (pdfs.get(active.document_id) ?? null) : null;
   const documentKey = session.documents.map((document) => document.id).join("\n");
   const frameHeight = FRAME_HEIGHT[settings.thumbnail_size];
-  const available = Math.max(0, workspaceHeight - SPLITTER);
+  const available = Math.max(0, workspaceHeight - SPLITTER - thumbnailToolbarHeight);
   const heights = paneHeights(available, dragRatio ?? settings.pane_ratio, oneRowHeight(settings.thumbnail_size));
   const onMetrics = useCallback((next: ZoomMetrics | null) => {
     setMetrics(next);
@@ -908,10 +896,14 @@ export function App() {
     if (!node) {
       return;
     }
-    const update = () => setWorkspaceHeight(node.clientHeight);
+    const update = () => {
+      setWorkspaceHeight(node.clientHeight);
+      setThumbnailToolbarHeight(thumbnailToolbarRef.current?.clientHeight ?? 0);
+    };
     update();
     const observer = new ResizeObserver(update);
     observer.observe(node);
+    if (thumbnailToolbarRef.current) observer.observe(thumbnailToolbarRef.current);
     return () => observer.disconnect();
   }, [access]);
 
@@ -2031,54 +2023,6 @@ export function App() {
     void runCommand({ type: "reorder", page_ids: pageIds, ...anchor });
   }
 
-  useLayoutEffect(() => {
-    const bar = toolbarRef.current;
-    if (!bar || view !== "edit") {
-      return;
-    }
-    const measure = () => {
-      const nodes = [...bar.querySelectorAll<HTMLElement>("[data-collapse]")];
-      const menu = bar.querySelector<HTMLElement>("[data-overflow-menu]");
-      bar.classList.remove("icons-only");
-      for (const node of nodes) {
-        node.hidden = false;
-      }
-      if (menu) {
-        menu.hidden = true;
-      }
-      let hideLabels = false;
-      const hidden: string[] = [];
-      if (bar.scrollWidth > bar.clientWidth + 1) {
-        hideLabels = true;
-        bar.classList.add("icons-only");
-        if (bar.scrollWidth > bar.clientWidth + 1) {
-          if (menu) {
-            menu.hidden = false;
-          }
-          for (const id of TOOLBAR_COLLAPSE_ORDER) {
-            const node = bar.querySelector<HTMLElement>(`[data-collapse="${id}"]`);
-            if (!node) {
-              continue;
-            }
-            node.hidden = true;
-            hidden.push(id);
-            if (bar.scrollWidth <= bar.clientWidth + 1) {
-              break;
-            }
-          }
-        }
-      }
-      setIconsOnly((current) => (current === hideLabels ? current : hideLabels));
-      setOverflow((current) => (current.join() === hidden.join() ? current : hidden));
-    };
-    measure();
-    const observer = new ResizeObserver(() => measure());
-    observer.observe(bar);
-    return () => observer.disconnect();
-  }, [view, loading, session.unsaved, session.split_unexported, settingsReady, access]);
-
-  const collapsed = new Set(overflow);
-
   const browserBanner = browserNotice ? (
     <div className="banner" role="status">
       <p>{browserNotice}</p>
@@ -2148,7 +2092,7 @@ export function App() {
         </nav>
       </header>
       <div className="editor" hidden={view !== "edit"} onDragOver={onDragOver} onDrop={onDrop}>
-      <header className={iconsOnly ? "toolbar icons-only" : "toolbar"} ref={toolbarRef}>
+      <header className="toolbar">
         <button
           type="button"
           className="tool"
@@ -2162,20 +2106,7 @@ export function App() {
             読み込みを中止
           </button>
         ) : null}
-        <span data-collapse="exit" hidden={collapsed.has("exit")}>
-          <TipButton label="終了" icon="exit" warn onClick={() => void quit()} />
-        </span>
-        <span data-collapse="start-fresh" hidden={collapsed.has("start-fresh")}>
-          <TipButton
-            label="新しく始める"
-            icon="start"
-            warn
-            disabled={startFreshReason !== undefined}
-            reason={startFreshReason}
-            onClick={() => void startFresh()}
-          />
-        </span>
-        <span data-collapse="undo" hidden={collapsed.has("undo")}>
+        <span>
           <TipButton
             label="元に戻す"
             icon="undo"
@@ -2184,7 +2115,7 @@ export function App() {
             onClick={() => void runCommand({ type: "undo" })}
           />
         </span>
-        <span data-collapse="redo" hidden={collapsed.has("redo")}>
+        <span>
           <TipButton
             label="やり直す"
             icon="redo"
@@ -2193,7 +2124,7 @@ export function App() {
             onClick={() => void runCommand({ type: "redo" })}
           />
         </span>
-        <span data-collapse="rotate-left" hidden={collapsed.has("rotate-left")}>
+        <span>
           <TipButton
             label="左回転"
             icon="left"
@@ -2202,7 +2133,7 @@ export function App() {
             onClick={() => rotateSelection("left")}
           />
         </span>
-        <span data-collapse="rotate-right" hidden={collapsed.has("rotate-right")}>
+        <span>
           <TipButton
             label="右回転"
             icon="right"
@@ -2211,7 +2142,7 @@ export function App() {
             onClick={() => rotateSelection("right")}
           />
         </span>
-        <span data-collapse="delete" hidden={collapsed.has("delete")}>
+        <span>
           <TipButton
             label="削除"
             icon="trash"
@@ -2261,46 +2192,15 @@ export function App() {
         <TipButton label="−" disabled={zoomOutReason !== undefined} reason={zoomOutReason} onClick={() => stepZoom(-1)} />
         <TipButton label="＋" disabled={zoomInReason !== undefined} reason={zoomInReason} onClick={() => stepZoom(1)} />
         <span className="zoom-label">{metrics && active ? formatPercent(metrics.effective) : ""}</span>
-        <span className="tool-group" data-collapse="layout" hidden={collapsed.has("layout")}>
+        <ToolbarMenu label="その他の操作">
           <TipButton
-            label="横一列"
-            icon="row"
-            pressed={settings.thumbnail_layout === "row"}
-            disabled={!settingsReady}
-            reason="設定の読み込みが終わると使えます。"
-            onClick={() => chooseLayout("row")}
+            label="新しく始める"
+            icon="start"
+            warn
+            disabled={startFreshReason !== undefined}
+            reason={startFreshReason}
+            onClick={() => void startFresh()}
           />
-          <TipButton
-            label="複数列"
-            icon="grid"
-            pressed={settings.thumbnail_layout === "grid"}
-            disabled={!settingsReady}
-            reason="設定の読み込みが終わると使えます。"
-            onClick={() => chooseLayout("grid")}
-          />
-          <TipButton
-            label="小"
-            pressed={settings.thumbnail_size === "small"}
-            disabled={!settingsReady}
-            reason="設定の読み込みが終わると使えます。"
-            onClick={() => chooseSize("small")}
-          />
-          <TipButton
-            label="中"
-            pressed={settings.thumbnail_size === "medium"}
-            disabled={!settingsReady}
-            reason="設定の読み込みが終わると使えます。"
-            onClick={() => chooseSize("medium")}
-          />
-          <TipButton
-            label="大"
-            pressed={settings.thumbnail_size === "large"}
-            disabled={!settingsReady}
-            reason="設定の読み込みが終わると使えます。"
-            onClick={() => chooseSize("large")}
-          />
-        </span>
-        <span data-collapse="clear-splits" hidden={collapsed.has("clear-splits")}>
           <TipButton
             label="すべての分割線を解除"
             icon="clear"
@@ -2308,55 +2208,8 @@ export function App() {
             reason={clearSplitsReason}
             onClick={() => void runCommand({ type: "clear_all_splits" })}
           />
-        </span>
-        <details className="overflow-menu" data-overflow-menu hidden={overflow.length === 0}>
-          <summary aria-label="その他の操作">...</summary>
-          <div className="menu-panel">
-            {collapsed.has("exit") ? (
-              <button type="button" className="warn-button" onClick={() => void quit()}>
-                終了
-              </button>
-            ) : null}
-            {collapsed.has("start-fresh") ? (
-              <button type="button" disabled={startFreshReason !== undefined} onClick={() => void startFresh()}>
-                新しく始める
-              </button>
-            ) : null}
-            {collapsed.has("layout") ? (
-              <>
-                <button type="button" disabled={!settingsReady} onClick={() => chooseLayout("row")}>横一列</button>
-                <button type="button" disabled={!settingsReady} onClick={() => chooseLayout("grid")}>複数列</button>
-                <button type="button" disabled={!settingsReady} onClick={() => chooseSize("small")}>小</button>
-                <button type="button" disabled={!settingsReady} onClick={() => chooseSize("medium")}>中</button>
-                <button type="button" disabled={!settingsReady} onClick={() => chooseSize("large")}>大</button>
-              </>
-            ) : null}
-            {collapsed.has("clear-splits") ? (
-              <button type="button" disabled={clearSplitsReason !== undefined} onClick={() => void runCommand({ type: "clear_all_splits" })}>
-                すべての分割線を解除
-              </button>
-            ) : null}
-            {collapsed.has("redo") ? (
-              <button type="button" disabled={Boolean(editLocked) || !session.redo_enabled} onClick={() => void runCommand({ type: "redo" })}>
-                やり直す
-              </button>
-            ) : null}
-            {collapsed.has("undo") ? (
-              <button type="button" disabled={Boolean(editLocked) || !session.undo_enabled} onClick={() => void runCommand({ type: "undo" })}>
-                元に戻す
-              </button>
-            ) : null}
-            {collapsed.has("rotate-left") ? (
-              <button type="button" disabled={selectionReason !== undefined} onClick={() => rotateSelection("left")}>左回転</button>
-            ) : null}
-            {collapsed.has("rotate-right") ? (
-              <button type="button" disabled={selectionReason !== undefined} onClick={() => rotateSelection("right")}>右回転</button>
-            ) : null}
-            {collapsed.has("delete") ? (
-              <button type="button" disabled={selectionReason !== undefined} onClick={deleteSelection}>削除</button>
-            ) : null}
-          </div>
-        </details>
+          <TipButton label="終了" icon="exit" warn onClick={() => void quit()} />
+        </ToolbarMenu>
         {session.unsaved ? (
           <button type="button" disabled={exportLocked} title={exportReason} onClick={() => void exportAll()}>
             未保存
@@ -2376,31 +2229,20 @@ export function App() {
         >
           全ページを書き出す
         </button>
-        <details className="export-menu" ref={exportMenuRef}>
-          <summary
-            onClick={(event) => {
-              if (exportLocked) {
-                event.preventDefault();
-              }
-            }}
-          >
-            分割・選択ページ
-          </summary>
-          <div className="menu-panel">
-            <TipButton
-              label="分割"
-              disabled={exportLocked}
-              reason={exportReason}
-              onClick={() => void exportSplit()}
-            />
-            <TipButton
-              label="選択ページ"
-              disabled={selectionExportReason !== undefined}
-              reason={selectionExportReason}
-              onClick={() => void exportSelection()}
-            />
-          </div>
-        </details>
+        <ToolbarMenu label="分割・選択ページ" menuRef={exportMenuRef} disabled={exportLocked}>
+          <TipButton
+            label="分割"
+            disabled={exportLocked}
+            reason={exportReason}
+            onClick={() => void exportSplit()}
+          />
+          <TipButton
+            label="選択ページ"
+            disabled={selectionExportReason !== undefined}
+            reason={selectionExportReason}
+            onClick={() => void exportSelection()}
+          />
+        </ToolbarMenu>
         <form className="jump" onSubmit={(event) => void jump(event)}>
           <input
             aria-label="ページ番号"
@@ -2410,7 +2252,7 @@ export function App() {
           />
           <button type="submit">移動</button>
         </form>
-        <span className="page-label">
+        <span className="page-label" role="status">
           総ページ数 {pages.length}　選択ページ数 {session.selected_page_ids.length}　元 PDF 数 {session.documents.length}
         </span>
       </header>
@@ -2474,7 +2316,8 @@ export function App() {
           </button>
         </div>
       ) : null}
-      <div className="workspace" ref={workspaceRef}>
+      <div className="workspace" ref={workspaceRef}
+        style={{ minHeight: PREVIEW_MIN + THUMB_MIN + SPLITTER + thumbnailToolbarHeight }}>
         <main
           className="stage"
           style={{ height: heights.preview }}
@@ -2498,6 +2341,46 @@ export function App() {
           tabIndex={0}
           onPointerDown={onSplitterPointerDown}
         />
+        <div className="thumbnail-toolbar" ref={thumbnailToolbarRef} aria-label="サムネイルの表示">
+          <span className="thumbnail-heading">サムネイル</span>
+          <TipButton
+            label="横一列"
+            icon="row"
+            pressed={settings.thumbnail_layout === "row"}
+            disabled={!settingsReady}
+            reason="設定の読み込みが終わると使えます。"
+            onClick={() => chooseLayout("row")}
+          />
+          <TipButton
+            label="複数列"
+            icon="grid"
+            pressed={settings.thumbnail_layout === "grid"}
+            disabled={!settingsReady}
+            reason="設定の読み込みが終わると使えます。"
+            onClick={() => chooseLayout("grid")}
+          />
+          <TipButton
+            label="小"
+            pressed={settings.thumbnail_size === "small"}
+            disabled={!settingsReady}
+            reason="設定の読み込みが終わると使えます。"
+            onClick={() => chooseSize("small")}
+          />
+          <TipButton
+            label="中"
+            pressed={settings.thumbnail_size === "medium"}
+            disabled={!settingsReady}
+            reason="設定の読み込みが終わると使えます。"
+            onClick={() => chooseSize("medium")}
+          />
+          <TipButton
+            label="大"
+            pressed={settings.thumbnail_size === "large"}
+            disabled={!settingsReady}
+            reason="設定の読み込みが終わると使えます。"
+            onClick={() => chooseSize("large")}
+          />
+        </div>
         <section className="thumb-pane" style={{ height: heights.thumbs }} ref={thumbsRef}>
           {pages.length > 0 ? (
             <ThumbnailStrip
